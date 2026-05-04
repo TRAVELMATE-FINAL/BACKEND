@@ -18,4 +18,4 @@ router.post("/profile", saveProfile);
 
 router.get("/profile", getProfile); // ✅ ADD THIS
 
-module.exports = router;
+module.exports = router; 
