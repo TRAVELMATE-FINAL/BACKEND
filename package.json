@@ -1,16 +1,16 @@
 {
-  "name": "server",
+  "name": "travelmate-server",
   "version": "1.0.0",
-  "description": "",
+  "description": "TravelMate ride-sharing backend (Node + Express + MongoDB)",
   "main": "server.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["travelmate", "ride-sharing", "express", "mongodb"],
+  "author": "Tesco Digitals",
+  "license": "ISC",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
