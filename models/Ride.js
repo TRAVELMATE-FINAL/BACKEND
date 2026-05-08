@@ -16,13 +16,11 @@ const rideSchema = new mongoose.Schema(
       trim: true,
     },
     date: {
-      // YYYY-MM-DD string from <input type="date" />
       type: String,
       required: [true, "Date is required"],
       trim: true,
     },
     time: {
-      // HH:MM (24h) string from <input type="time" />
       type: String,
       required: [true, "Time is required"],
       trim: true,
@@ -38,11 +36,27 @@ const rideSchema = new mongoose.Schema(
     distance: { type: String, required: [true, "Distance is required"], trim: true },
     duration: { type: String, required: [true, "Duration is required"], trim: true },
 
-    // Optional coordinates from PostRide.jsx (used to draw route on map)
+    // Coordinates from PostRide map
     fromLat: { type: Number, default: null },
     fromLon: { type: Number, default: null },
     toLat:   { type: Number, default: null },
     toLon:   { type: Number, default: null },
+
+    // ── Connect/Unlock fields ─────────────────────────────────────
+    // Phone of the user who posted this ride. Used to look up name/photo.
+    userPhone: { type: String, default: "", trim: true },
+
+    // Vehicle info shown on Connect page (Figma)
+    vehicle:      { type: String, default: "Bike", trim: true },     // "Car" | "Bike"
+    vehicleModel: { type: String, default: "",     trim: true },     // e.g. "Swift"
+    vehicleColor: { type: String, default: "",     trim: true },     // e.g. "White"
+    plateNumber:  { type: String, default: "",     trim: true },     // e.g. "TN09 AB1234"
+    seatsAvailable: { type: Number, default: 1, min: 0 },            // pillion/seats free
+
+    additionalInfo: { type: String, default: "", maxlength: 500 },
+
+    // # of times someone opened the connect page for this ride
+    viewCount: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

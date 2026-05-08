@@ -9,12 +9,17 @@ const connectDB = require("./config/db");
 // Routes
 const authRoutes = require("./routes/registerRoutes");   // OTP / profile (existing)
 const rideRoutes = require("./routes/rideRoutes");       // PostRide / FindRide
-const mapRoutes  = require("./routes/mapRoutes");        // /api/geocode + /api/route
+const mapRoutes  = require("./routes/mapRoutes");
+const planRoutes = require("./routes/planRoutes");        // /api/geocode + /api/route
 
 const app = express();
 
 // ----- DB -----
-connectDB();
+const { ensureCouponsSeeded } = require("./controllers/planController");
+connectDB().then(() => {
+  // Auto-seed default coupons (WELCOME10, TRAVEL50, etc.) if Atlas is empty
+  setTimeout(() => ensureCouponsSeeded().catch(() => {}), 1500);
+});
 
 // ----- Middleware -----
 app.use(cors());
@@ -24,7 +29,8 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // ----- Mount routes -----
 app.use("/api/auth",  authRoutes);   // /api/auth/send-otp, /verify-otp, /profile
 app.use("/api/rides", rideRoutes);   // /api/rides, /api/rides/search
-app.use("/api",       mapRoutes);    // /api/geocode, /api/route
+app.use("/api",       mapRoutes);
+app.use("/api/plans", planRoutes);    // /api/geocode, /api/route
 
 // ----- Health check -----
 app.get("/", (req, res) => {
@@ -49,5 +55,5 @@ app.use((err, req, res, next) => {
 // ----- Start -----
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log("🚀 Server running on http://localhost:" + PORT);
 });
