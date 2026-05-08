@@ -326,15 +326,14 @@ router.post("/:id/unlock", async (req, res) => {
     if (err.name === "CastError") {
       return res.status(400).json({
         success: false,
-        error: "Invalid ride id",
-        message: "Invalid ride id",
+        error: "Invalid ride ID",
+        message: "Invalid ride ID",
       });
     }
-    console.error("unlockContact error:", err);
     return res.status(500).json({
       success: false,
-      error: "Server error while unlocking contact",
-      message: "Server error while unlocking contact",
+      error: err.message || "Internal server error",
+      message: err.message || "Internal server error",
     });
   }
 });

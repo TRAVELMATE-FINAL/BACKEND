@@ -22,7 +22,19 @@ connectDB().then(() => {
 });
 
 // ----- Middleware -----
-app.use(cors());
+// CORS — allow local dev + production frontends
+const corsOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+app.use(cors({
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true);                 // Postman / curl / mobile native
+    if (origin.includes("localhost")) return cb(null, true);
+    if (corsOrigins.length === 0) return cb(null, true); // permissive in dev
+    if (corsOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error("CORS: origin not allowed: " + origin));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 

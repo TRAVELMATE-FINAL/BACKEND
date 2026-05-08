@@ -10,6 +10,6 @@ router.get("/can-post",    ctrl.canPostRide);       // post-ride gate
 router.get("/coupon/list",   ctrl.listCoupons);     // list active coupons (chips on SecurePayment)
 router.post("/coupon/apply", ctrl.applyCoupon);     // validate + compute cashback
 router.post("/order",        ctrl.createOrder);     // create Razorpay order
-router.post("/verify",       ctrl.verifyPayment);   // verify signature + save sub
+router.post("/verify",       ctrl.verifyPayment);   // verify HMAC + save Subscription
 
 module.exports = router;
