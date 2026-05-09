@@ -177,42 +177,139 @@ router.get("/", async (req, res) => {
 });
 
 // ============================================================
+// GET /api/rides/by-user?phone=…   — profile + posted rides
+//
+// Used by the Profile Settings page. Returns:
+//   • user        – profile snapshot (name, email, photo, gender, etc.)
+//   • rides       – every ride this user has posted, newest first
+//   • stats       – totals (totalPosted, upcoming, totalSeatsOffered)
+//
+// Phone numbers can be stored as +91…, 91… or bare 10 digits — we match
+// every variant so the count is stable no matter how the phone was saved.
+// ============================================================
+router.get("/by-user", async (req, res) => {
+  try {
+    const phoneRaw = String(req.query.phone || "").trim();
+    if (!phoneRaw) {
+      return res.status(400).json({
+        success: false,
+        error: "phone query param is required",
+        message: "phone query param is required",
+      });
+    }
+
+    const last10 = phoneRaw.replace(/\D/g, "").slice(-10);
+    const phoneVariants = [phoneRaw];
+    if (last10.length === 10) {
+      phoneVariants.push("+91" + last10, "91" + last10, last10);
+    }
+
+    const user = await findUserByPhone(phoneRaw);
+    const rides = await Ride.find({ userPhone: { $in: phoneVariants } })
+      .sort({ createdAt: -1 });
+
+    const todayISOStr = todayStr();
+    const upcoming = rides.filter((r) => (r.date || "") >= todayISOStr).length;
+    const totalSeats = rides.reduce(
+      (sum, r) => sum + (typeof r.seatsAvailable === "number" ? r.seatsAvailable : 0),
+      0
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        user: user
+          ? {
+              fullName: user.fullName || "",
+              email: user.email || "",
+              photo: user.photo || "",
+              city: user.city || "",
+              gender: user.gender || "",
+              phone: user.phone || phoneRaw,
+              memberSince: user.createdAt || null,
+            }
+          : {
+              fullName: "",
+              email: "",
+              photo: "",
+              city: "",
+              gender: "",
+              phone: phoneRaw,
+              memberSince: null,
+            },
+        stats: {
+          totalPosted: rides.length,
+          upcoming,
+          totalSeatsOffered: totalSeats,
+        },
+        rides: rides.map((r) => ({
+          _id: r._id,
+          from: r.from,
+          to: r.to,
+          date: r.date,
+          time: r.time,
+          gender: r.gender,
+          distance: r.distance,
+          duration: r.duration,
+          vehicle: r.vehicle || "Bike",
+          vehicleModel: r.vehicleModel || "",
+          vehicleColor: r.vehicleColor || "",
+          plateNumber: r.plateNumber || "",
+          seatsAvailable: typeof r.seatsAvailable === "number" ? r.seatsAvailable : 1,
+          additionalInfo: r.additionalInfo || "",
+          viewCount: r.viewCount || 0,
+          createdAt: r.createdAt,
+        })),
+      },
+    });
+  } catch (err) {
+    console.error("getRidesByUser error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Server error while loading your profile",
+      message: "Server error while loading your profile",
+    });
+  }
+});
+
+// ============================================================
 // GET /api/rides/search?from=&to=&date=&gender= — FindRide → FindFriends
-//   • from / to   – partial, case-insensitive match (so "Chennai"
-//                   also finds "Chennai Central")
-//   • date        – optional, exact "YYYY-MM-DD" match
-//   • gender      – optional, "Male" | "Female" | "Any"
+//   ALL params are optional. The endpoint AND-combines whatever is
+//   present:
+//     • from / to   – partial, case-insensitive match
+//     • date        – exact "YYYY-MM-DD" match
+//     • gender      – "Male" | "Female" | "Any"
+//   At least ONE filter must be supplied — calling /search with no
+//   params returns 400 (use GET /api/rides for that).
 // ============================================================
 router.get("/search", async (req, res) => {
   try {
     const { from, to, date, gender } = req.query;
-    if (!from || !to) {
+
+    // Trim everything once
+    const fromT   = (from   || "").trim();
+    const toT     = (to     || "").trim();
+    const dateT   = (date   || "").trim();
+    const genderT = (gender || "").trim();
+
+    if (!fromT && !toT && !dateT && !genderT) {
       return res.status(400).json({
         success: false,
-        error: "Both 'from' and 'to' query params are required",
-        message: "Both 'from' and 'to' query params are required",
+        error: "Provide at least one filter (from, to, date or gender)",
+        message: "Provide at least one filter (from, to, date or gender)",
       });
     }
 
     // Escape regex special chars so city names like "Pondicherry (UT)"
     // don't break the query.
     const escapeRx = (s) =>
-      String(s).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-    const query = {
-      from: { $regex: escapeRx(from), $options: "i" },
-      to:   { $regex: escapeRx(to),   $options: "i" },
-    };
-
-    // Exact date filter (YYYY-MM-DD) when provided
-    if (date && String(date).trim()) {
-      query.date = String(date).trim();
-    }
-
-    // Optional gender filter — case-insensitive equality
-    if (gender && String(gender).trim()) {
-      query.gender = { $regex: `^${escapeRx(gender)}$`, $options: "i" };
-    }
+    const query = {};
+    if (fromT)   query.from   = { $regex: escapeRx(fromT), $options: "i" };
+    if (toT)     query.to     = { $regex: escapeRx(toT),   $options: "i" };
+    if (dateT)   query.date   = dateT;
+    if (genderT) query.gender = { $regex: `^${escapeRx(genderT)}$`, $options: "i" };
 
     const rides = await Ride.find(query).sort({ createdAt: -1 });
 
@@ -310,6 +407,104 @@ router.get("/:id/connect", async (req, res) => {
       success: false,
       error: "Server error while loading connect page",
       message: "Server error while loading connect page",
+    });
+  }
+});
+
+// ============================================================
+// GET /api/rides/:id/details — full ride + driver profile + stats
+//   Used by the RideDetail page (the "View Ride" CTA on RideLive).
+//   Returns the same ride payload as /connect plus driver-level stats:
+//     • totalPostedRides — how many rides this user has ever posted
+//     • upcomingRides    — count of future rides by the same user
+// ============================================================
+router.get("/:id/details", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ride = await Ride.findById(id);
+    if (!ride) {
+      return res.status(404).json({
+        success: false,
+        error: "Ride not found",
+        message: "Ride not found",
+      });
+    }
+
+    const user = await findUserByPhone(ride.userPhone);
+
+    // Phones can be stored as +91… / 91… / bare 10-digits. Match any of
+    // those forms when counting the driver's total posts.
+    const driverPhone = String(ride.userPhone || "").trim();
+    const last10 = driverPhone.replace(/\D/g, "").slice(-10);
+    const phoneVariants = driverPhone ? [driverPhone] : [];
+    if (last10.length === 10) {
+      phoneVariants.push("+91" + last10, "91" + last10, last10);
+    }
+
+    const phoneClause = phoneVariants.length
+      ? { userPhone: { $in: phoneVariants } }
+      : { userPhone: driverPhone };
+
+    const todayISOStr = todayStr();
+    const [totalPostedRides, upcomingRides] = await Promise.all([
+      driverPhone ? Ride.countDocuments(phoneClause) : Promise.resolve(0),
+      driverPhone
+        ? Ride.countDocuments({ ...phoneClause, date: { $gte: todayISOStr } })
+        : Promise.resolve(0),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        ride: {
+          _id: ride._id,
+          from: ride.from,
+          to: ride.to,
+          date: ride.date,
+          time: ride.time,
+          gender: ride.gender,
+          distance: ride.distance,
+          duration: ride.duration,
+          fromLat: ride.fromLat,
+          fromLon: ride.fromLon,
+          toLat: ride.toLat,
+          toLon: ride.toLon,
+          vehicle: ride.vehicle || "Bike",
+          vehicleModel: ride.vehicleModel || "",
+          vehicleColor: ride.vehicleColor || "",
+          plateNumber: ride.plateNumber || "",
+          seatsAvailable: typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1,
+          additionalInfo: ride.additionalInfo || "",
+          viewCount: ride.viewCount || 0,
+          createdAt: ride.createdAt,
+        },
+        driver: {
+          fullName: user?.fullName?.trim() || "TravelMate Rider",
+          photo: user?.photo || "",
+          city: user?.city || "",
+          email: user?.email || "",
+          maskedPhone: maskPhone(driverPhone),
+          stats: {
+            totalPostedRides,
+            upcomingRides,
+            memberSince: user?.createdAt || null,
+          },
+        },
+      },
+    });
+  } catch (err) {
+    if (err.name === "CastError") {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid ride id",
+        message: "Invalid ride id",
+      });
+    }
+    console.error("getRideDetails error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Server error while loading ride details",
+      message: "Server error while loading ride details",
     });
   }
 });
