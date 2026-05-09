@@ -25,6 +25,16 @@ const currentHHMM = () => {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
 
+// Normalize a phone string to the canonical "+91XXXXXXXXXX" form so
+// rides + users use identical strings and look-ups always match.
+const normalizePhone = (raw) => {
+  const digits = String(raw || "").replace(/\D/g, "");
+  if (digits.length === 0) return "";
+  const last10 = digits.slice(-10);
+  if (last10.length !== 10) return String(raw || "").trim();
+  return "+91" + last10;
+};
+
 // "+919876543210" → "+91 98*****210"
 const maskPhone = (phone) => {
   if (!phone) return "";
@@ -101,6 +111,11 @@ router.post("/", async (req, res) => {
       });
     }
 
+    // Normalize the poster's phone to "+91XXXXXXXXXX" so it matches
+    // User.phone (which is always saved with the +91 prefix). This
+    // makes the driver-name lookup on /details / /connect deterministic.
+    const normalizedUserPhone = normalizePhone(userPhone);
+
     const ride = await Ride.create({
       from: from.trim(),
       to: to.trim(),
@@ -113,7 +128,7 @@ router.post("/", async (req, res) => {
       fromLon: fromLon ?? null,
       toLat:   toLat   ?? null,
       toLon:   toLon   ?? null,
-      userPhone: (userPhone || "").trim(),
+      userPhone: normalizedUserPhone,
       vehicle: vehicle || "Bike",
       vehicleModel: vehicleModel || "",
       vehicleColor: vehicleColor || "",
@@ -431,6 +446,10 @@ router.get("/:id/details", async (req, res) => {
     }
 
     const user = await findUserByPhone(ride.userPhone);
+    console.log(
+      `[details] rideId=${id} userPhone="${ride.userPhone}" → ` +
+      `user=${user ? user.fullName || "(no fullName)" : "(not found)"}`
+    );
 
     // Phones can be stored as +91… / 91… / bare 10-digits. Match any of
     // those forms when counting the driver's total posts.
@@ -483,6 +502,10 @@ router.get("/:id/details", async (req, res) => {
           photo: user?.photo || "",
           city: user?.city || "",
           email: user?.email || "",
+          // Both forms — frontend can pick. RideDetail shows the
+          // unmasked phone since the user has already paid by the
+          // time they land on that page.
+          phone: driverPhone,
           maskedPhone: maskPhone(driverPhone),
           stats: {
             totalPostedRides,
