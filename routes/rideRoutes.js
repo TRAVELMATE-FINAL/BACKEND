@@ -177,11 +177,15 @@ router.get("/", async (req, res) => {
 });
 
 // ============================================================
-// GET /api/rides/search?from=&to= — FindRide → FindFriends
+// GET /api/rides/search?from=&to=&date=&gender= — FindRide → FindFriends
+//   • from / to   – partial, case-insensitive match (so "Chennai"
+//                   also finds "Chennai Central")
+//   • date        – optional, exact "YYYY-MM-DD" match
+//   • gender      – optional, "Male" | "Female" | "Any"
 // ============================================================
 router.get("/search", async (req, res) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, date, gender } = req.query;
     if (!from || !to) {
       return res.status(400).json({
         success: false,
@@ -190,10 +194,27 @@ router.get("/search", async (req, res) => {
       });
     }
 
-    const rides = await Ride.find({
-      from: { $regex: `^${from.trim()}$`, $options: "i" },
-      to:   { $regex: `^${to.trim()}$`,   $options: "i" },
-    }).sort({ createdAt: -1 });
+    // Escape regex special chars so city names like "Pondicherry (UT)"
+    // don't break the query.
+    const escapeRx = (s) =>
+      String(s).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    const query = {
+      from: { $regex: escapeRx(from), $options: "i" },
+      to:   { $regex: escapeRx(to),   $options: "i" },
+    };
+
+    // Exact date filter (YYYY-MM-DD) when provided
+    if (date && String(date).trim()) {
+      query.date = String(date).trim();
+    }
+
+    // Optional gender filter — case-insensitive equality
+    if (gender && String(gender).trim()) {
+      query.gender = { $regex: `^${escapeRx(gender)}$`, $options: "i" };
+    }
+
+    const rides = await Ride.find(query).sort({ createdAt: -1 });
 
     if (rides.length === 0) {
       return res.status(200).json({
