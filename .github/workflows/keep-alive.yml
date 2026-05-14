@@ -1,0 +1,32 @@
+name: Keep TravelMate backend awake
+
+# Pings /health every 10 minutes so Render's free tier doesn't spin down.
+# Runs on a fixed schedule via GitHub Actions cron — completely free, no
+# external service needed.
+#
+# NOTE: GitHub cron has a ~5–15 min variance under load. That's fine for
+# Render's 15-min idle window — even with variance we hit it well in time.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+  workflow_dispatch: {}      # also lets you trigger it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /health
+        run: |
+          echo "Pinging TravelMate backend..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 60 \
+            https://travelmate-backend-dzpq.onrender.com/health)
+          echo "HTTP $STATUS"
+          # Render cold-starts can return 503 briefly while waking — that's
+          # still success for our purposes (we've kicked it awake).
+          if [ "$STATUS" = "200" ] || [ "$STATUS" = "503" ]; then
+            exit 0
+          fi
+          exit 1
