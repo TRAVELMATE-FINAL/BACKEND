@@ -44,14 +44,43 @@ app.use("/api/rides", rideRoutes);   // /api/rides, /api/rides/search
 app.use("/api",       mapRoutes);
 app.use("/api/plans", planRoutes);    // /api/geocode, /api/route
 
-// ----- Health check -----
-app.get("/", (req, res) => {
-  res.json({ message: "TravelMate API Running" });
+// ----- Lightweight request log so Render logs show every URL hit -----
+app.use((req, _res, next) => {
+  console.log(`➡️  ${req.method} ${req.originalUrl}`);
+  next();
 });
 
-// ----- 404 -----
+// ----- Health check -----
+app.get("/", (req, res) => {
+  res.json({
+    message: "TravelMate API Running",
+    routesMounted: [
+      "POST /api/auth/send-otp",
+      "POST /api/auth/verify-otp",
+      "POST /api/auth/profile",
+      "GET  /api/auth/profile",
+      "POST /api/rides",
+      "GET  /api/rides",
+      "GET  /api/route",
+      "GET  /api/plans",
+      "POST /api/plans/order",
+      "POST /api/plans/verify",
+    ],
+  });
+});
+
+// ----- Verbose 404 (tells you exactly what path was requested) -----
 app.use((req, res) => {
-  res.status(404).json({ success: false, message: "Route not found" });
+  console.warn(`❌ 404: ${req.method} ${req.originalUrl}`);
+  res.status(404).json({
+    success: false,
+    message: "Route not found",
+    requested: `${req.method} ${req.originalUrl}`,
+    hint:
+      "If you expected this route, check that the backend has been " +
+      "redeployed on Render with the latest code and that the URL on " +
+      "the frontend matches.",
+  });
 });
 
 // ----- Global error handler -----
