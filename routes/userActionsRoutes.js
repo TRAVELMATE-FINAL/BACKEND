@@ -144,7 +144,7 @@ router.post("/report", async (req, res) => {
         message: "You can't report yourself",
       });
     }
-    const VALID = ["Spam", "Inappropriate behavior", "Safety concern", "Other"];
+    const VALID = ["Spam", "Fake profile", "Inappropriate behavior", "Safety concern", "Other"];
     if (!VALID.includes(reason)) {
       return res.status(400).json({
         success: false,

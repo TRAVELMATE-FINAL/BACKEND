@@ -10,7 +10,7 @@ const reportSchema = new mongoose.Schema(
     reportedPhone: { type: String, required: true, index: true },
     reason: {
       type: String,
-      enum: ["Spam", "Inappropriate behavior", "Safety concern", "Other"],
+      enum: ["Spam", "Fake profile", "Inappropriate behavior", "Safety concern", "Other"],
       required: true,
     },
     details: { type: String, default: "", maxlength: 1000 },
