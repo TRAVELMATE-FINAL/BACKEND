@@ -12,6 +12,7 @@ const rideRoutes         = require("./routes/rideRoutes");
 const mapRoutes          = require("./routes/mapRoutes");
 const planRoutes         = require("./routes/planRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
+const userActionsRoutes  = require("./routes/userActionsRoutes");
 
 const app = express();
 
@@ -49,6 +50,7 @@ app.use("/api/rides",         rideRoutes);
 app.use("/api",               mapRoutes);
 app.use("/api/plans",         planRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/users",         userActionsRoutes);
 
 // ----- Root: simple healthcheck + route listing -----
 app.get("/", function (_req, res) {
@@ -67,6 +69,10 @@ app.get("/", function (_req, res) {
       "GET  /api/plans",
       "POST /api/plans/order",
       "POST /api/plans/verify",
+      "POST /api/users/block",
+      "DELETE /api/users/block/:phone",
+      "GET  /api/users/blocked",
+      "POST /api/users/report",
       "GET  /health"
     ]
   });
