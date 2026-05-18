@@ -577,4 +577,130 @@ router.post("/:id/unlock", async (req, res) => {
   }
 });
 
+
+// ============================================================
+// PATCH /api/rides/:id — owner edits an existing ride
+//
+// Body accepts any of: date, time, seatsAvailable, gender,
+// vehicle, vehicleModel, vehicleColor, plateNumber, additionalInfo
+// Requires phone (in body or query) and only the ride owner can edit.
+// ============================================================
+router.patch("/:id", async (req, res) => {
+  try {
+    const rideId = String(req.params.id || "");
+    if (!rideId) {
+      return res.status(400).json({ success: false, error: "Ride id required", message: "Ride id required" });
+    }
+
+    const phoneRaw = String(req.body?.phone || req.query?.phone || "").trim();
+    if (!phoneRaw) {
+      return res.status(400).json({ success: false, error: "phone is required", message: "phone is required" });
+    }
+    const last10 = phoneRaw.replace(/\D/g, "").slice(-10);
+    const phoneVariants = [phoneRaw];
+    if (last10.length === 10) {
+      phoneVariants.push("+91" + last10, "91" + last10, last10);
+    }
+
+    const ride = await Ride.findById(rideId);
+    if (!ride) {
+      return res.status(404).json({ success: false, error: "Ride not found", message: "Ride not found" });
+    }
+    if (!phoneVariants.includes(ride.userPhone)) {
+      return res.status(403).json({
+        success: false,
+        error: "You do not own this ride",
+        message: "You do not own this ride",
+      });
+    }
+
+    // Whitelist editable fields so the user can't reassign owner / coords etc.
+    const editable = [
+      "date", "time", "seatsAvailable", "gender",
+      "vehicle", "vehicleModel", "vehicleColor", "plateNumber",
+      "additionalInfo",
+    ];
+    for (const k of editable) {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
+        if (k === "seatsAvailable") {
+          const n = Number(req.body[k]);
+          if (!Number.isFinite(n) || n < 1 || n > 8) {
+            return res.status(400).json({
+              success: false, error: "Seats must be 1-8", message: "Seats must be 1-8",
+            });
+          }
+          ride[k] = n;
+        } else if (k === "plateNumber") {
+          ride[k] = String(req.body[k] || "").toUpperCase().replace(/[\s-]/g, "");
+        } else {
+          ride[k] = req.body[k];
+        }
+      }
+    }
+
+    await ride.save();
+    return res.status(200).json({
+      success: true,
+      message: "Ride updated",
+      data: { ride },
+    });
+  } catch (err) {
+    console.error("PATCH ride error:", err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || "Internal server error",
+      message: err.message || "Internal server error",
+    });
+  }
+});
+
+// ============================================================
+// DELETE /api/rides/:id — owner deletes their own ride
+// phone passed in body OR query string for ownership check.
+// ============================================================
+router.delete("/:id", async (req, res) => {
+  try {
+    const rideId = String(req.params.id || "");
+    if (!rideId) {
+      return res.status(400).json({ success: false, error: "Ride id required", message: "Ride id required" });
+    }
+
+    const phoneRaw = String(req.body?.phone || req.query?.phone || "").trim();
+    if (!phoneRaw) {
+      return res.status(400).json({ success: false, error: "phone is required", message: "phone is required" });
+    }
+    const last10 = phoneRaw.replace(/\D/g, "").slice(-10);
+    const phoneVariants = [phoneRaw];
+    if (last10.length === 10) {
+      phoneVariants.push("+91" + last10, "91" + last10, last10);
+    }
+
+    const ride = await Ride.findById(rideId);
+    if (!ride) {
+      return res.status(404).json({ success: false, error: "Ride not found", message: "Ride not found" });
+    }
+    if (!phoneVariants.includes(ride.userPhone)) {
+      return res.status(403).json({
+        success: false,
+        error: "You do not own this ride",
+        message: "You do not own this ride",
+      });
+    }
+
+    await Ride.deleteOne({ _id: ride._id });
+    return res.status(200).json({
+      success: true,
+      message: "Ride deleted",
+      data: { _id: ride._id },
+    });
+  } catch (err) {
+    console.error("DELETE ride error:", err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || "Internal server error",
+      message: err.message || "Internal server error",
+    });
+  }
+});
+
 module.exports = router;
