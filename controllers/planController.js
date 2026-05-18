@@ -127,7 +127,11 @@ exports.applyCoupon = async (req, res) => {
 // ===========================================================
 exports.createOrder = async (req, res) => {
   try {
-    const { plan, couponCode } = req.body;
+    // `amount` (in paise) may be sent by the frontend for fixed-fee payments
+    // (e.g. UnlockContact ₹50). When provided and valid, use it directly
+    // instead of recomputing from the plan catalog — this ensures the
+    // Razorpay popup always matches what the user sees on screen.
+    const { plan, couponCode, amount: clientAmountPaise } = req.body;
     const phone = normPhone(req.body.phone);
     if (!phone) return res.status(400).json({ message: "Valid phone is required" });
     if (!PLAN_CATALOG[plan]) return res.status(400).json({ message: "Invalid plan" });
@@ -147,6 +151,14 @@ exports.createOrder = async (req, res) => {
       }
     }
 
+    // If the frontend sent an explicit amount in paise, trust it.
+    // Convert to rupees, validate it is a positive number, then use it.
+    // This handles fixed-fee pages (UnlockContact) where the price is
+    // not the same as the plan catalog price.
+    if (clientAmountPaise && Number(clientAmountPaise) > 0) {
+      finalAmount = Math.round(Number(clientAmountPaise)) / 100;
+    }
+
     const client = getRazorpay();
     if (!client) {
       return res.status(500).json({ message: "Razorpay is not configured on server" });
@@ -163,7 +175,7 @@ exports.createOrder = async (req, res) => {
     res.json({
       orderId: order.id,
       key: process.env.RAZORPAY_KEY_ID,
-      amount: order.amount,         // paise
+      amount: order.amount,         // paise — always matches what we charged
       currency: order.currency,
       plan,
       originalAmount,
@@ -211,7 +223,9 @@ exports.verifyPayment = async (req, res) => {
       return res.status(401).json({ message: "Invalid Razorpay signature" });
     }
 
-    // Recompute cashback server-side (don't trust client)
+    // Recompute cashback server-side (don't trust client).
+    // For fixed-fee payments (e.g. UnlockContact), fetch the actual charged
+    // amount from the Razorpay order so amountPaid is always accurate.
     const originalAmount = PLAN_CATALOG[plan].price;
     let cashback = 0;
     let coupon = null;
@@ -222,7 +236,20 @@ exports.verifyPayment = async (req, res) => {
         if (valid.ok) cashback = coupon.computeCashback(originalAmount);
       }
     }
-    const amountPaid = Math.max(0, originalAmount - cashback);
+
+    // Fetch actual charged amount from Razorpay order (most accurate source)
+    let amountPaid = Math.max(0, originalAmount - cashback);
+    try {
+      const client = getRazorpay();
+      if (client) {
+        const rzpOrder = await client.orders.fetch(razorpay_order_id);
+        if (rzpOrder && rzpOrder.amount) {
+          amountPaid = rzpOrder.amount / 100; // convert paise to rupees
+        }
+      }
+    } catch (_e) {
+      // Non-fatal — fall back to computed value
+    }
 
     // Compute end date
     const startDate = new Date();
