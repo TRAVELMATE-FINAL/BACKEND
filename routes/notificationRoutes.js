@@ -69,6 +69,37 @@ router.patch("/:id/read", async (req, res) => {
   }
 });
 
+// PATCH /api/notifications/mark-all-read?phone=+91...
+//
+// Bulk-marks every unread notification for the given phone as read.
+// Called by the NotificationsPage on mount so the bell-icon count in
+// the header drops to 0 as soon as the user opens the inbox.
+router.patch("/mark-all-read", async (req, res) => {
+  try {
+    const phone = normalizePhone(req.query.phone || req.body?.phone || "");
+    if (!phone) {
+      return res.status(400).json({
+        success: false,
+        message: "phone is required (query or body)",
+      });
+    }
+    const result = await Notification.updateMany(
+      { userPhone: phone, read: { $ne: true } },
+      { $set: { read: true } }
+    );
+    return res.json({
+      success: true,
+      data: { modifiedCount: result.modifiedCount || 0 },
+    });
+  } catch (err) {
+    console.error("❌ PATCH /api/notifications/mark-all-read error:", err);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Failed to mark all notifications as read",
+    });
+  }
+});
+
 // POST /api/notifications
 // body: { userPhone, type, title, body, action: { to } }
 router.post("/", async (req, res) => {

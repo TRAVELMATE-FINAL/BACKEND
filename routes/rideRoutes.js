@@ -7,6 +7,7 @@ const router = express.Router();
 
 const Ride = require("../models/Ride");
 const User = require("../models/User");
+const Booking = require("../models/Booking");
 
 // ============================================================
 // HELPERS
@@ -554,6 +555,41 @@ router.post("/:id/unlock", async (req, res) => {
         error: "No contact info available for this ride",
         message: "No contact info available for this ride",
       });
+    }
+
+    // Record this unlock as a Booking so it shows in the admin panel.
+    // Keyed on (rideId, riderPhone) and upserted, so re-unlocking the
+    // same ride doesn't create duplicate bookings.
+    const riderPhone = normalizePhone(req.body?.riderPhone || "");
+    const posterPhone = ride.userPhone;
+    if (riderPhone && riderPhone !== normalizePhone(posterPhone)) {
+      try {
+        const [rider, poster] = await Promise.all([
+          findUserByPhone(riderPhone),
+          findUserByPhone(posterPhone),
+        ]);
+        await Booking.findOneAndUpdate(
+          { rideId: ride._id, riderPhone },
+          {
+            $setOnInsert: {
+              rideId: ride._id,
+              from: ride.from,
+              to: ride.to,
+              date: ride.date,
+              time: ride.time,
+              posterPhone,
+              posterName: poster?.fullName || "",
+              riderPhone,
+              riderName: rider?.fullName || "",
+              status: "booked",
+            },
+          },
+          { upsert: true, new: true }
+        );
+      } catch (bookingErr) {
+        // Non-fatal — never block the contact reveal on a booking write.
+        console.warn("[unlock] Booking record skipped:", bookingErr.message);
+      }
     }
 
     return res.status(200).json({

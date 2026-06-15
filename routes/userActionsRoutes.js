@@ -152,10 +152,22 @@ router.post("/report", async (req, res) => {
       });
     }
 
+    // Denormalize names so the admin panel can show who reported whom
+    // without extra lookups.
+    const [reporterUser, reportedUser] = await Promise.all([
+      User.findOne({ phone: reporterPhone }).lean(),
+      User.findOne({ phone: reportedPhone }).lean(),
+    ]);
+
     const report = await Report.create({
       reporterPhone,
+      reporterName: reporterUser?.fullName || "",
       reportedPhone,
+      reportedName: reportedUser?.fullName || "",
       reason,
+      // Write both the canonical field (admin reads this) and the
+      // legacy mirror so nothing depends on field-name drift.
+      description: details,
       details,
     });
 

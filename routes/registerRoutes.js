@@ -82,6 +82,17 @@ router.post("/verify-otp", async (req, res) => {
 
     let user = await User.findOne({ phone: fullPhone });
 
+    // Block enforcement — a user blocked from the admin panel cannot log in.
+    if (user && user.isBlocked) {
+      return res.status(403).json({
+        message:
+          user.blockReason
+            ? `Your account has been blocked: ${user.blockReason}`
+            : "Your account has been blocked. Please contact support.",
+        blocked: true,
+      });
+    }
+
     if (!user) {
       user = await User.create({
         phone: fullPhone,

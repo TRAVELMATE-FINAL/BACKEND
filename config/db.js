@@ -24,13 +24,21 @@ async function cleanupStaleIndexes() {
 
 const connectDB = async () => {
   try {
-    const conn = await mongoose.connect(process.env.MONGO_URI);
-    console.log(`✅ MongoDB Connected: ${conn.connection.host}`);
+    if (!process.env.MONGO_URI) {
+      throw new Error("MONGO_URI is not set in the environment.");
+    }
+    // Pin the database name to "Tesco" no matter what the URI path says.
+    // This guarantees the customer app and the admin panel read/write the
+    // SAME database, even if a deployment's MONGO_URI omits "/Tesco"
+    // (otherwise Mongoose silently falls back to the "test" database and
+    // rides/payments/bookings appear to be "missing").
+    const conn = await mongoose.connect(process.env.MONGO_URI, { dbName: "Tesco" });
+    console.log(`MongoDB Connected: host=${conn.connection.host} db=${conn.connection.name}`);
 
     // Run once after the connection is open
     await cleanupStaleIndexes();
   } catch (err) {
-    console.error(`❌ MongoDB Error: ${err.message}`);
+    console.error(`MongoDB Error: ${err.message}`);
     process.exit(1);
   }
 };

@@ -89,6 +89,36 @@ app.get("/health", function (_req, res) {
   });
 });
 
+// ----- /api/_dbhealth: confirm WHICH database is connected + live counts -----
+// Open this URL in a browser to verify data is actually being stored in the
+// shared "Tesco" Atlas database (the same one the admin panel reads).
+// Example: https://travelmate-backend-dzpq.onrender.com/api/_dbhealth
+app.get("/api/_dbhealth", async function (_req, res) {
+  try {
+    const mongoose = require("mongoose");
+    const conn = mongoose.connection;
+    const states = ["disconnected", "connected", "connecting", "disconnecting"];
+    const db = conn.db;
+    const counts = {};
+    if (db) {
+      const names = ["users", "rides", "subscriptions", "bookings", "reports", "coupons"];
+      for (const n of names) {
+        counts[n] = await db.collection(n).countDocuments().catch(function () { return "n/a"; });
+      }
+    }
+    res.json({
+      ok: true,
+      connectionState: states[conn.readyState] || conn.readyState,
+      database: conn.name || "(unknown)",
+      host: conn.host || "(unknown)",
+      counts,
+      note: "These counts come from the database this backend is connected to. The admin panel must read the SAME database name.",
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
 // ----- Verbose 404 -----
 app.use(function (req, res) {
   console.warn("404:", req.method, req.originalUrl);
