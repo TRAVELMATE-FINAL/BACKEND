@@ -3,13 +3,57 @@ const crypto = require("crypto");
 const Razorpay = require("razorpay");
 const Subscription = require("../models/Subscription");
 const Coupon = require("../models/Coupon");
+const Setting = require("../models/Setting");
 
-// ── Plan catalogue (single source of truth, used by FE + BE) ──
-const PLAN_CATALOG = {
-  daily:   { name: "Daily Plan",   price: 30,   durationDays: 1,   sub: "Short-term Access", feature: "Unlimited Post Any Route For 24 Hours" },
-  monthly: { name: "Monthly Plan", price: 650,  durationDays: 30,  sub: "High Engagement",   feature: "Unlimited Post Any Route For 1 Month" },
-  yearly:  { name: "Yearly Plan",  price: 1200, durationDays: 365, sub: "Ultimate Savings",  feature: "Unlimited Post Any Route For 1 Year" },
+// ── Static plan metadata (labels only — prices/durations come from the DB) ──
+const PLAN_META = {
+  daily:   { name: "Daily Plan",   sub: "Short-term Access", feature: "Unlimited Post Any Route For 24 Hours" },
+  monthly: { name: "Monthly Plan", sub: "High Engagement",   feature: "Unlimited Post Any Route For 1 Month" },
+  yearly:  { name: "Yearly Plan",  sub: "Ultimate Savings",  feature: "Unlimited Post Any Route For 1 Year" },
 };
+
+// ── Fallback prices/durations (used if the Setting doc is missing a value) ──
+const DEFAULTS = {
+  daily:   { price: 30,   durationDays: 1 },
+  monthly: { price: 650,  durationDays: 30 },
+  yearly:  { price: 1200, durationDays: 365 },
+  findRide:{ unlockFee: 49, processingFee: 1 },
+};
+
+const num = (v, fallback) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : fallback);
+
+// Load the live pricing document (admin-editable). Always reads the DB so a
+// price change in the admin panel reflects on the website on the next request.
+async function loadPricingDoc() {
+  try {
+    const doc = await Setting.findOne({ key: "pricing" }).lean();
+    return doc || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Build the full plan catalog (labels + live price/duration) keyed by plan.
+async function loadCatalog() {
+  const doc = await loadPricingDoc();
+  const p = (doc && doc.plans) || {};
+  const build = (key) => ({
+    ...PLAN_META[key],
+    price: num(p[key] && p[key].price, DEFAULTS[key].price),
+    durationDays: num(p[key] && p[key].durationDays, DEFAULTS[key].durationDays),
+  });
+  return { daily: build("daily"), monthly: build("monthly"), yearly: build("yearly") };
+}
+
+// Live find-ride (unlock) fees.
+async function loadFindFee() {
+  const doc = await loadPricingDoc();
+  const f = (doc && doc.findRide) || {};
+  return {
+    unlockFee: num(f.unlockFee, DEFAULTS.findRide.unlockFee),
+    processingFee: num(f.processingFee, DEFAULTS.findRide.processingFee),
+  };
+}
 
 // ── Razorpay client (lazy) ──
 let rzp = null;
@@ -32,24 +76,41 @@ const normPhone = (raw = "") => {
 };
 
 // ===========================================================
-// GET /api/plans
-// Returns the three plan cards for the FE Chooseyourplan page.
+// GET /api/plans  — the three plan cards for Chooseyourplan.
 // ===========================================================
-exports.getPlans = (req, res) => {
-  const plans = Object.entries(PLAN_CATALOG).map(([key, p]) => ({
-    key,
-    name: p.name,
-    sub: p.sub,
-    feature: p.feature,
-    price: p.price,
-    durationDays: p.durationDays,
-  }));
-  res.json({ plans });
+exports.getPlans = async (req, res) => {
+  try {
+    const catalog = await loadCatalog();
+    const plans = Object.entries(catalog).map(([key, p]) => ({
+      key,
+      name: p.name,
+      sub: p.sub,
+      feature: p.feature,
+      price: p.price,
+      durationDays: p.durationDays,
+    }));
+    res.json({ plans });
+  } catch (err) {
+    console.error("getPlans error:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ===========================================================
+// GET /api/plans/find-fee  — live unlock + processing fee.
+// ===========================================================
+exports.getFindFee = async (req, res) => {
+  try {
+    const fee = await loadFindFee();
+    res.json(fee);
+  } catch (err) {
+    console.error("getFindFee error:", err);
+    res.status(500).json({ message: err.message });
+  }
 };
 
 // ===========================================================
 // GET /api/plans/me?phone=+91...
-// Returns the user's currently-active subscription (if any).
 // ===========================================================
 exports.getMySubscription = async (req, res) => {
   try {
@@ -79,20 +140,20 @@ exports.getMySubscription = async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("❌ getMySubscription error:", err);
+    console.error("getMySubscription error:", err);
     res.status(500).json({ message: err.message });
   }
 };
 
 // ===========================================================
-// POST /api/plans/coupon/apply
-// Body: { code, plan }   →   { ok, cashback, finalAmount, originalAmount }
+// POST /api/plans/coupon/apply   Body: { code, plan }
 // ===========================================================
 exports.applyCoupon = async (req, res) => {
   try {
     const { code, plan } = req.body;
     if (!code || !plan) return res.status(400).json({ message: "code and plan are required" });
-    if (!PLAN_CATALOG[plan]) return res.status(400).json({ message: "Invalid plan" });
+    const catalog = await loadCatalog();
+    if (!catalog[plan]) return res.status(400).json({ message: "Invalid plan" });
 
     const coupon = await Coupon.findOne({ code: String(code).toUpperCase().trim() });
     if (!coupon) return res.status(404).json({ message: "Invalid coupon code" });
@@ -100,7 +161,7 @@ exports.applyCoupon = async (req, res) => {
     const valid = coupon.isValidNow(plan);
     if (!valid.ok) return res.status(400).json({ message: valid.reason });
 
-    const originalAmount = PLAN_CATALOG[plan].price;
+    const originalAmount = catalog[plan].price;
     const cashback = coupon.computeCashback(originalAmount);
     const finalAmount = Math.max(0, originalAmount - cashback);
 
@@ -115,28 +176,23 @@ exports.applyCoupon = async (req, res) => {
       expiresAt: coupon.expiresAt,
     });
   } catch (err) {
-    console.error("❌ applyCoupon error:", err);
+    console.error("applyCoupon error:", err);
     res.status(500).json({ message: err.message });
   }
 };
 
 // ===========================================================
-// POST /api/plans/order
-// Body: { phone, plan, couponCode? }
-// → creates a Razorpay order; FE opens checkout; on success FE calls /verify
+// POST /api/plans/order   Body: { phone, plan, couponCode?, amount? }
 // ===========================================================
 exports.createOrder = async (req, res) => {
   try {
-    // `amount` (in paise) may be sent by the frontend for fixed-fee payments
-    // (e.g. UnlockContact ₹50). When provided and valid, use it directly
-    // instead of recomputing from the plan catalog — this ensures the
-    // Razorpay popup always matches what the user sees on screen.
     const { plan, couponCode, amount: clientAmountPaise } = req.body;
     const phone = normPhone(req.body.phone);
     if (!phone) return res.status(400).json({ message: "Valid phone is required" });
-    if (!PLAN_CATALOG[plan]) return res.status(400).json({ message: "Invalid plan" });
+    const catalog = await loadCatalog();
+    if (!catalog[plan]) return res.status(400).json({ message: "Invalid plan" });
 
-    const originalAmount = PLAN_CATALOG[plan].price;
+    const originalAmount = catalog[plan].price;
     let cashback = 0;
     let finalAmount = originalAmount;
     let coupon = null;
@@ -151,10 +207,7 @@ exports.createOrder = async (req, res) => {
       }
     }
 
-    // If the frontend sent an explicit amount in paise, trust it.
-    // Convert to rupees, validate it is a positive number, then use it.
-    // This handles fixed-fee pages (UnlockContact) where the price is
-    // not the same as the plan catalog price.
+    // Fixed-fee pages (UnlockContact) send an explicit amount in paise.
     if (clientAmountPaise && Number(clientAmountPaise) > 0) {
       finalAmount = Math.round(Number(clientAmountPaise)) / 100;
     }
@@ -164,7 +217,6 @@ exports.createOrder = async (req, res) => {
       return res.status(500).json({ message: "Razorpay is not configured on server" });
     }
 
-    // Razorpay wants paise (₹1 = 100 paise)
     const order = await client.orders.create({
       amount: Math.round(finalAmount * 100),
       currency: "INR",
@@ -175,7 +227,7 @@ exports.createOrder = async (req, res) => {
     res.json({
       orderId: order.id,
       key: process.env.RAZORPAY_KEY_ID,
-      amount: order.amount,         // paise — always matches what we charged
+      amount: order.amount,
       currency: order.currency,
       plan,
       originalAmount,
@@ -184,16 +236,13 @@ exports.createOrder = async (req, res) => {
       couponCode: couponCode || "",
     });
   } catch (err) {
-    console.error("❌ createOrder error:", err);
+    console.error("createOrder error:", err);
     res.status(500).json({ message: err.message || "Could not create order" });
   }
 };
 
 // ===========================================================
 // POST /api/plans/verify
-// Body: { razorpay_order_id, razorpay_payment_id, razorpay_signature,
-//         phone, plan, couponCode? }
-// Verifies the HMAC signature and saves the Subscription row.
 // ===========================================================
 exports.verifyPayment = async (req, res) => {
   try {
@@ -206,14 +255,14 @@ exports.verifyPayment = async (req, res) => {
     } = req.body;
     const phone = normPhone(req.body.phone);
 
-    if (!phone || !PLAN_CATALOG[plan]) {
+    const catalog = await loadCatalog();
+    if (!phone || !catalog[plan]) {
       return res.status(400).json({ message: "Phone and valid plan are required" });
     }
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ message: "Missing Razorpay fields" });
     }
 
-    // Verify signature
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(razorpay_order_id + "|" + razorpay_payment_id)
@@ -223,10 +272,7 @@ exports.verifyPayment = async (req, res) => {
       return res.status(401).json({ message: "Invalid Razorpay signature" });
     }
 
-    // Recompute cashback server-side (don't trust client).
-    // For fixed-fee payments (e.g. UnlockContact), fetch the actual charged
-    // amount from the Razorpay order so amountPaid is always accurate.
-    const originalAmount = PLAN_CATALOG[plan].price;
+    const originalAmount = catalog[plan].price;
     let cashback = 0;
     let coupon = null;
     if (couponCode) {
@@ -237,25 +283,23 @@ exports.verifyPayment = async (req, res) => {
       }
     }
 
-    // Fetch actual charged amount from Razorpay order (most accurate source)
+    // Actual charged amount from Razorpay order (most accurate).
     let amountPaid = Math.max(0, originalAmount - cashback);
     try {
       const client = getRazorpay();
       if (client) {
         const rzpOrder = await client.orders.fetch(razorpay_order_id);
         if (rzpOrder && rzpOrder.amount) {
-          amountPaid = rzpOrder.amount / 100; // convert paise to rupees
+          amountPaid = rzpOrder.amount / 100;
         }
       }
     } catch (_e) {
-      // Non-fatal — fall back to computed value
+      // Non-fatal
     }
 
-    // Compute end date
     const startDate = new Date();
-    const endDate = new Date(startDate.getTime() + PLAN_CATALOG[plan].durationDays * 24 * 60 * 60 * 1000);
+    const endDate = new Date(startDate.getTime() + catalog[plan].durationDays * 24 * 60 * 60 * 1000);
 
-    // Mark any existing active subs as expired (single active sub per user)
     await Subscription.updateMany(
       { phone, status: "active" },
       { $set: { status: "expired" } }
@@ -276,7 +320,6 @@ exports.verifyPayment = async (req, res) => {
       amountPaid,
     });
 
-    // Increment coupon usage
     if (coupon) {
       coupon.usedCount += 1;
       if (!coupon.usedByPhones.includes(phone)) {
@@ -285,9 +328,7 @@ exports.verifyPayment = async (req, res) => {
       await coupon.save();
     }
 
-    console.log("📝 SUBSCRIPTION → saved to Atlas:", {
-      _id: sub._id, phone, plan, endDate, amountPaid,
-    });
+    console.log("SUBSCRIPTION saved:", { _id: sub._id, phone, plan, endDate, amountPaid });
 
     res.json({
       ok: true,
@@ -300,14 +341,13 @@ exports.verifyPayment = async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("❌ verifyPayment error:", err);
+    console.error("verifyPayment error:", err);
     res.status(500).json({ message: err.message || "Verification failed" });
   }
 };
 
 // ===========================================================
 // GET /api/plans/can-post?phone=+91...
-// Lightweight gate used by Post Ride before publishing.
 // ===========================================================
 exports.canPostRide = async (req, res) => {
   try {
@@ -324,13 +364,10 @@ exports.canPostRide = async (req, res) => {
     const daysLeft = Math.ceil((sub.endDate - now) / (1000 * 60 * 60 * 24));
     res.json({ canPostRide: true, plan: sub.plan, daysLeft, endDate: sub.endDate });
   } catch (err) {
-    console.error("❌ canPostRide error:", err);
+    console.error("canPostRide error:", err);
     res.status(500).json({ message: err.message });
   }
 };
-
-// ==================================
-
 
 // ===========================================================
 // GET /api/plans/coupon/list?plan=daily
@@ -372,7 +409,7 @@ exports.ensureCouponsSeeded = async () => {
     const count = await Coupon.estimatedDocumentCount();
     if (count > 0) return { seeded: false, count };
 
-    const DEFAULTS = [
+    const DEFAULT_COUPONS = [
       ["WELCOME10",  "percent",  10, 100, 60, []],
       ["TRAVEL50",   "flat",     50,   0, 45, []],
       ["NEWUSER100", "flat",    100,   0, 30, []],
@@ -381,7 +418,7 @@ exports.ensureCouponsSeeded = async () => {
       ["YEARLY500",  "flat",    500,   0, 90, ["yearly"]],
     ];
     let inserted = 0;
-    for (const [code, type, value, maxCashback, days, appliesTo] of DEFAULTS) {
+    for (const [code, type, value, maxCashback, days, appliesTo] of DEFAULT_COUPONS) {
       const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
       const desc = type === "percent"
         ? value + "% off" + (maxCashback ? " up to Rs." + maxCashback : "")
@@ -400,4 +437,6 @@ exports.ensureCouponsSeeded = async () => {
   }
 };
 
-exports.PLAN_CATALOG = PLAN_CATALOG;
+// Compatibility export (defaults only; live values come from the DB).
+exports.PLAN_META = PLAN_META;
+exports.DEFAULT_PRICING = DEFAULTS;
