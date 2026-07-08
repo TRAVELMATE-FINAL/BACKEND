@@ -48,7 +48,7 @@ router.post("/send-otp", async (req, res) => {
     console.log("✅ SMS SID:", message.sid);
     console.log("🔑 OTP (debug):", otp);
 
-    setOtp(fullPhone, otp);
+    await setOtp(fullPhone, otp);
 
     return res.json({ message: "OTP sent successfully" });
   } catch (err) {
@@ -74,7 +74,7 @@ router.post("/verify-otp", async (req, res) => {
     const cleanPhone = phone.replace("+91", "");
     const fullPhone = `+91${cleanPhone}`;
 
-    const isValid = checkOtp(fullPhone, otp);
+    const isValid = await checkOtp(fullPhone, otp);
 
     if (!isValid) {
       return res.status(400).json({ message: "Invalid or expired OTP" });
