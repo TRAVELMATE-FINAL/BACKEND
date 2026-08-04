@@ -303,11 +303,15 @@ router.get("/profile", async (req, res) => {
 // ======================
 router.get("/twilio-status", (req, res) => {
   const sid = process.env.TWILIO_SID || "";
+  const tok = process.env.TWILIO_AUTH_TOKEN || "";
   res.json({
     sidPrefix: sid ? sid.slice(0, 6) : "(empty)",
     sidLength: sid.length,
-    hasAuthToken: !!process.env.TWILIO_AUTH_TOKEN,
-    authTokenLength: (process.env.TWILIO_AUTH_TOKEN || "").length,
+    hasAuthToken: !!tok,
+    authTokenLength: tok.length,
+    // First 4 + last 4 chars so you can tell WHICH token is loaded.
+    // Correct Live token -> "c672...f59a".  API-key secret -> "fGCm...QIw5".
+    authTokenFingerprint: tok ? tok.slice(0, 4) + "..." + tok.slice(-4) : "(empty)",
     fromPhoneRaw: process.env.TWILIO_PHONE || "(empty)",
     fromPhoneUsed: String(process.env.TWILIO_PHONE || "").replace(/[^\d+]/g, "") || "(empty)",
   });
