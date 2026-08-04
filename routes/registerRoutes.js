@@ -39,9 +39,14 @@ router.post("/send-otp", async (req, res) => {
 
     console.log("MESSAGE BODY:", messageText);
 
+    // Sanitize the From number: Twilio's console shows it formatted with
+    // spaces (e.g. "+1 828 492 2880"), and pasting that stores spaces which
+    // Twilio rejects. Strip everything except digits and a leading "+".
+    const fromNumber = String(process.env.TWILIO_PHONE || "").replace(/[^\d+]/g, "");
+
     const message = await client.messages.create({
       body: messageText,
-      from: process.env.TWILIO_PHONE,
+      from: fromNumber,
       to: fullPhone,
     });
 
@@ -303,7 +308,8 @@ router.get("/twilio-status", (req, res) => {
     sidLength: sid.length,
     hasAuthToken: !!process.env.TWILIO_AUTH_TOKEN,
     authTokenLength: (process.env.TWILIO_AUTH_TOKEN || "").length,
-    fromPhone: process.env.TWILIO_PHONE || "(empty)",
+    fromPhoneRaw: process.env.TWILIO_PHONE || "(empty)",
+    fromPhoneUsed: String(process.env.TWILIO_PHONE || "").replace(/[^\d+]/g, "") || "(empty)",
   });
 });
 
