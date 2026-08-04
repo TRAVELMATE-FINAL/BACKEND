@@ -291,4 +291,20 @@ router.get("/profile", async (req, res) => {
   }
 });
 
+// ======================
+// DIAGNOSTIC: which Twilio config did the RUNNING server load?
+// GET /api/auth/twilio-status
+// Safe: SID is masked, auth token is never returned.
+// ======================
+router.get("/twilio-status", (req, res) => {
+  const sid = process.env.TWILIO_SID || "";
+  res.json({
+    sidPrefix: sid ? sid.slice(0, 6) : "(empty)",
+    sidLength: sid.length,
+    hasAuthToken: !!process.env.TWILIO_AUTH_TOKEN,
+    authTokenLength: (process.env.TWILIO_AUTH_TOKEN || "").length,
+    fromPhone: process.env.TWILIO_PHONE || "(empty)",
+  });
+});
+
 module.exports = router;
