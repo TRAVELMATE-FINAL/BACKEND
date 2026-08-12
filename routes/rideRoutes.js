@@ -300,34 +300,128 @@ router.get("/by-user", async (req, res) => {
 // ============================================================
 router.get("/search", async (req, res) => {
   try {
-    const { from, to, date, gender } = req.query;
+    // NOTE: date is intentionally NOT used to filter search results — users
+    // can find rides without picking a date.
+    const { from, to, gender, fromLat, fromLon, toLat, toLon } = req.query;
 
-    // Trim everything once
     const fromT   = (from   || "").trim();
     const toT     = (to     || "").trim();
-    const dateT   = (date   || "").trim();
     const genderT = (gender || "").trim();
 
-    if (!fromT && !toT && !dateT && !genderT) {
+    const num = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const fLat = num(fromLat), fLon = num(fromLon);
+    const tLat = num(toLat),   tLon = num(toLon);
+    const hasFromGeo = fLat !== null && fLon !== null;
+    const hasToGeo   = tLat !== null && tLon !== null;
+
+    if (!fromT && !toT && !genderT && !hasFromGeo && !hasToGeo) {
       return res.status(400).json({
         success: false,
-        error: "Provide at least one filter (from, to, date or gender)",
-        message: "Provide at least one filter (from, to, date or gender)",
+        error: "Provide at least one filter (from, to or gender)",
+        message: "Provide at least one filter (from, to or gender)",
       });
     }
 
-    // Escape regex special chars so city names like "Pondicherry (UT)"
-    // don't break the query.
-    const escapeRx = (s) =>
-      String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // ── Configurable nearby radius (km) ──────────────────────────────
+    // Change NEARBY_RADIUS_KM in the backend env to widen/narrow how far
+    // "nearby" reaches. Not hardcoded throughout — this single value drives it.
+    const RADIUS_KM = num(process.env.NEARBY_RADIUS_KM) || 15;
 
-    const query = {};
-    if (fromT)   query.from   = { $regex: escapeRx(fromT), $options: "i" };
-    if (toT)     query.to     = { $regex: escapeRx(toT),   $options: "i" };
-    if (dateT)   query.date   = dateT;
-    if (genderT) query.gender = { $regex: `^${escapeRx(genderT)}$`, $options: "i" };
+    const escapeRx = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-    const rides = await Ride.find(query).sort({ createdAt: -1 });
+    // Significant tokens for text/similar-name matching (ignores fillers).
+    const STOP = new Set([
+      "india", "tamil", "nadu", "state", "district", "near",
+      "road", "street", "the", "and", "junction", "railway", "station",
+    ]);
+    const tokensOf = (s) =>
+      String(s).toLowerCase().split(/[^a-z0-9]+/i).filter((t) => t.length >= 3 && !STOP.has(t));
+
+    const textMatch = (storedVal, term) => {
+      if (!term) return false;
+      const v = String(storedVal || "").toLowerCase();
+      if (v.includes(term.toLowerCase())) return true;
+      return tokensOf(term).some((t) => v.includes(t));
+    };
+
+    // Great-circle distance in km between two lat/lon points.
+    const haversineKm = (aLat, aLon, bLat, bLon) => {
+      const toRad = (d) => (d * Math.PI) / 180;
+      const R = 6371;
+      const dLat = toRad(bLat - aLat);
+      const dLon = toRad(bLon - aLon);
+      const h =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+    };
+
+    // Candidate rides. With coordinates we match by distance in JS (nearby
+    // places have different names, so a text prefilter would miss them), so we
+    // pull the gender-filtered set. Without coordinates we keep the fast
+    // text/similar-name query.
+    let candidates;
+    if (hasFromGeo || hasToGeo) {
+      const dbq = {};
+      if (genderT) dbq.gender = { $regex: `^${escapeRx(genderT)}$`, $options: "i" };
+      candidates = await Ride.find(dbq).sort({ createdAt: -1 });
+    } else {
+      const fieldMatch = (field, term) => {
+        const ors = [{ [field]: { $regex: escapeRx(term), $options: "i" } }];
+        tokensOf(term).forEach((t) =>
+          ors.push({ [field]: { $regex: escapeRx(t), $options: "i" } })
+        );
+        return { $or: ors };
+      };
+      const and = [];
+      if (fromT)   and.push(fieldMatch("from", fromT));
+      if (toT)     and.push(fieldMatch("to", toT));
+      if (genderT) and.push({ gender: { $regex: `^${escapeRx(genderT)}$`, $options: "i" } });
+      candidates = await Ride.find(and.length ? { $and: and } : {}).sort({ createdAt: -1 });
+    }
+
+    // Evaluate one location field (from OR to) for a ride.
+    // Passes if the field is unconstrained, OR text/similar-name matches, OR
+    // (coords supplied AND the ride's stored coords are within RADIUS_KM).
+    const evalField = (term, gLat, gLon, hasGeo, rLat, rLon, storedVal) => {
+      const constrained = !!term || hasGeo;
+      if (!constrained) return { pass: true, dist: 0, exact: false };
+
+      const txtOk = term ? textMatch(storedVal, term) : false;
+
+      let dist = Infinity, geoOk = false;
+      const rl = num(rLat), rn = num(rLon);
+      if (hasGeo && rl !== null && rn !== null) {
+        dist = haversineKm(gLat, gLon, rl, rn);
+        geoOk = dist <= RADIUS_KM;
+      }
+      const exact =
+        term && String(storedVal || "").trim().toLowerCase() === term.toLowerCase();
+      // Distance used for ranking: exact geo distance if geo-matched, 0 if it
+      // matched by text (treat name matches as closest), else Infinity.
+      const rankDist = geoOk ? dist : (txtOk ? 0 : Infinity);
+      return { pass: txtOk || geoOk, dist: rankDist, exact: !!exact };
+    };
+
+    const scored = [];
+    for (const r of candidates) {
+      const fromR = evalField(fromT, fLat, fLon, hasFromGeo, r.fromLat, r.fromLon, r.from);
+      const toR   = evalField(toT,   tLat, tLon, hasToGeo,   r.toLat,   r.toLon,   r.to);
+      if (!fromR.pass || !toR.pass) continue;
+
+      const dist =
+        (Number.isFinite(fromR.dist) ? fromR.dist : 0) +
+        (Number.isFinite(toR.dist) ? toR.dist : 0);
+      const exactScore = (fromR.exact ? 1 : 0) + (toR.exact ? 1 : 0);
+      scored.push({ ride: r, dist, exactScore });
+    }
+
+    // Prioritise exact matches, then nearest by combined distance.
+    scored.sort((a, b) => (b.exactScore - a.exactScore) || (a.dist - b.dist));
+    const rides = scored.map((s) => s.ride);
 
     if (rides.length === 0) {
       return res.status(200).json({
