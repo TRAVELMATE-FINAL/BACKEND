@@ -22,19 +22,33 @@ connectDB().then(() => {
   setTimeout(function () { ensureCouponsSeeded().catch(function () {}); }, 1500);
 });
 
-// ----- Middleware -----
+// ----- CORS -----
+// Normalize origins (lowercase, strip trailing slash) so a stray "/" in
+// CORS_ORIGINS can't cause "No Access-Control-Allow-Origin" failures.
+const norm = (s) => String(s || "").trim().replace(/\/+$/, "").toLowerCase();
 const corsOrigins = (process.env.CORS_ORIGINS || "")
-  .split(",").map(function (s) { return s.trim(); }).filter(Boolean);
-app.use(cors({
+  .split(",").map(norm).filter(Boolean);
+
+const corsOptions = {
   origin: function (origin, cb) {
+    // Non-browser / same-origin requests have no Origin header.
     if (!origin) return cb(null, true);
-    if (origin.indexOf("localhost") !== -1) return cb(null, true);
+    const o = norm(origin);
+    const host = o.replace(/^https?:\/\//, "").split(":")[0];
+    // Always allow local dev and the app's own domains (any vooggly.com host).
+    if (host === "localhost" || host === "127.0.0.1") return cb(null, true);
+    if (host === "vooggly.com" || host.endsWith(".vooggly.com")) return cb(null, true);
+    // Otherwise honour the configured allow-list (empty = allow all).
     if (corsOrigins.length === 0) return cb(null, true);
-    if (corsOrigins.indexOf(origin) !== -1) return cb(null, true);
-    return cb(new Error("CORS: origin not allowed: " + origin));
+    if (corsOrigins.indexOf(o) !== -1) return cb(null, true);
+    // Deny WITHOUT throwing so the preflight still gets a clean response.
+    return cb(null, false);
   },
   credentials: true,
-}));
+};
+app.use(cors(corsOptions));
+// Answer preflight (OPTIONS) for every route with the same policy.
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 

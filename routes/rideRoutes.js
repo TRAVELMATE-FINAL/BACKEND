@@ -52,6 +52,17 @@ async function notify(userPhone, title, body, to) {
   } catch (e) { /* non-fatal */ }
 }
 
+// Strip contact info (phone numbers, emails) from public-facing notes so a
+// number typed into "Notes & preferences" is never exposed publicly. Contact
+// is only shared after an accepted Request to Ride.
+function sanitizeNotes(text) {
+  if (!text) return "";
+  let out = String(text);
+  out = out.replace(/\+?\d[\d\s\-().]{7,}\d/g, "[contact hidden]"); // phone-like
+  out = out.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[contact hidden]"); // emails
+  return out.replace(/\s{2,}/g, " ").trim();
+}
+
 // Throttled sweep: mark past-due active rides as expired and cascade their
 // still-pending requests → expired (notifying the riders). Runs at most once
 // per 60s so it doesn't add load to every request.
@@ -68,8 +79,8 @@ async function sweepExpiredRides() {
       const pend = await RideRequest.find({ rideId: r._id, status: "pending" });
       for (const req of pend) {
         await RideRequest.updateOne({ _id: req._id }, { $set: { status: "expired" } });
-        notify(req.riderPhone, "Ride expired",
-          `The ride ${r.from} → ${r.to} has expired, so your request was closed.`, "");
+        notify(req.riderPhone, "Ride Expired",
+          `The ride from ${r.from} to ${r.to} has reached its scheduled time and is no longer available. Your request has been closed.`, "");
       }
     }
   } catch (e) { /* non-fatal */ }
@@ -231,6 +242,8 @@ const enrichRidesWithUser = async (rides) => {
     obj.driverName = user?.fullName?.trim() || "TravelMate Rider";
     obj.driverPhoto = user?.photo || "";
     obj.driverCity = user?.city || "";
+    // Never expose a phone/email typed into notes in public ride lists.
+    obj.additionalInfo = sanitizeNotes(obj.additionalInfo);
     out.push(obj);
   }
   return out;
@@ -368,11 +381,12 @@ router.get("/search", async (req, res) => {
   try {
     // NOTE: date is intentionally NOT used to filter search results — users
     // can find rides without picking a date.
-    const { from, to, gender, fromLat, fromLon, toLat, toLon } = req.query;
+    const { from, to, gender, vehicle, fromLat, fromLon, toLat, toLon } = req.query;
 
-    const fromT   = (from   || "").trim();
-    const toT     = (to     || "").trim();
-    const genderT = (gender || "").trim();
+    const fromT    = (from    || "").trim();
+    const toT      = (to      || "").trim();
+    const genderT  = (gender  || "").trim();
+    const vehicleT = (vehicle || "").trim().toLowerCase(); // "car" | "bike" | ""
 
     const num = (v) => {
       const n = Number(v);
@@ -475,6 +489,13 @@ router.get("/search", async (req, res) => {
     // Never surface expired/closed rides, even to a direct search.
     candidates = candidates.filter((r) => !isRideExpired(r));
 
+    // Vehicle-type filter — case-insensitive (bike/Bike/BIKE all match).
+    if (vehicleT) {
+      candidates = candidates.filter(
+        (r) => String(r.vehicle || "").trim().toLowerCase() === vehicleT
+      );
+    }
+
     const scored = [];
     for (const r of candidates) {
       const fromR = evalField(fromT, fLat, fLon, hasFromGeo, r.fromLat, r.fromLon, r.from);
@@ -570,7 +591,7 @@ router.get("/:id/connect", async (req, res) => {
           vehicleColor: ride.vehicleColor || "",
           plateNumber: ride.plateNumber || "",
           seatsAvailable: typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1,
-          additionalInfo: ride.additionalInfo || "",
+          additionalInfo: sanitizeNotes(ride.additionalInfo),
           viewCount: (ride.viewCount || 0) + 1,
           createdAt: ride.createdAt,
         },
@@ -676,7 +697,7 @@ router.get("/:id/details", async (req, res) => {
           vehicleColor: ride.vehicleColor || "",
           plateNumber: ride.plateNumber || "",
           seatsAvailable: typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1,
-          additionalInfo: ride.additionalInfo || "",
+          additionalInfo: sanitizeNotes(ride.additionalInfo),
           viewCount: ride.viewCount || 0,
           createdAt: ride.createdAt,
           status: rideStatusLabel(ride),
@@ -967,8 +988,8 @@ router.post("/:id/request", async (req, res) => {
     if (reqDoc) { Object.assign(reqDoc, snap); await reqDoc.save(); }
     else { reqDoc = await RideRequest.create({ rideId: ride._id, ...snap }); }
 
-    notify(ride.userPhone, "New ride request",
-      `${rider?.fullName || "A rider"} requested to join ${ride.from} → ${ride.to}.`, "/requests");
+    notify(ride.userPhone, "New Ride Request",
+      `A user has requested to join your ride from ${ride.from} to ${ride.to}. Please review the request and choose Accept or Reject.`, "/requests");
 
     return res.status(201).json({ success: true, message: "Request sent", data: reqDoc });
   } catch (err) {
@@ -1056,8 +1077,8 @@ router.post("/requests/:reqId/accept", async (req, res) => {
     if (reqDoc.status !== "pending") return res.status(400).json({ success: false, message: `Request already ${reqDoc.status}` });
     reqDoc.status = "accepted";
     await reqDoc.save();
-    notify(reqDoc.riderPhone, "Request accepted",
-      `Your request for ${ride?.from || ""} → ${ride?.to || ""} was accepted — the ride is confirmed and contact is now available.`,
+    notify(reqDoc.riderPhone, "Ride Request Accepted",
+      `Your request has been accepted. You can now view the permitted contact details for this confirmed ride.`,
       "/requests");
     return res.json({ success: true, message: "Request accepted", data: reqDoc });
   } catch (err) {
@@ -1078,8 +1099,8 @@ router.post("/requests/:reqId/reject", async (req, res) => {
     reqDoc.status = "rejected";
     await reqDoc.save();
     const ride = await Ride.findById(reqDoc.rideId);
-    notify(reqDoc.riderPhone, "Request rejected",
-      `Your request for ${ride?.from || ""} → ${ride?.to || ""} was declined.`, "/requests");
+    notify(reqDoc.riderPhone, "Ride Request Update",
+      `Your request to join the ride was not accepted by the ride owner.`, "/requests");
     return res.json({ success: true, message: "Request rejected", data: reqDoc });
   } catch (err) {
     console.error("rejectRequest error:", err);
@@ -1101,8 +1122,8 @@ router.post("/requests/:reqId/cancel", async (req, res) => {
     reqDoc.status = "cancelled";
     await reqDoc.save();
     const ride = await Ride.findById(reqDoc.rideId);
-    notify(reqDoc.posterPhone, "Request cancelled",
-      `A rider cancelled their request for ${ride?.from || ""} → ${ride?.to || ""}.`, "/requests");
+    notify(reqDoc.posterPhone, "Ride Request Cancelled",
+      `A rider has cancelled their request to join your ride from ${ride?.from || ""} to ${ride?.to || ""}.`, "/requests");
     return res.json({ success: true, message: "Request cancelled", data: reqDoc });
   } catch (err) {
     console.error("cancelRequest error:", err);
@@ -1124,8 +1145,8 @@ router.post("/:id/close", async (req, res) => {
     for (const r of pend) {
       r.status = "cancelled";
       await r.save();
-      notify(r.riderPhone, "Ride closed",
-        `The ride ${ride.from} → ${ride.to} was closed by the owner, so your request was cancelled.`, "");
+      notify(r.riderPhone, "Ride Closed",
+        `The ride from ${ride.from} to ${ride.to} has been closed by the owner. Your request has been cancelled.`, "");
     }
     return res.json({ success: true, message: "Ride closed", data: { _id: ride._id, status: "closed" } });
   } catch (err) {
