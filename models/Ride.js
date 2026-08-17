@@ -53,7 +53,18 @@ const rideSchema = new mongoose.Schema(
     plateNumber:  { type: String, default: "",     trim: true },     // e.g. "TN09 AB1234"
     seatsAvailable: { type: Number, default: 1, min: 0 },            // pillion/seats free
 
+    // Notes / preferences — completely OPTIONAL.
     additionalInfo: { type: String, default: "", maxlength: 500 },
+
+    // Lifecycle status. "active" by default; becomes "expired" automatically
+    // once the ride's date+time passes, or "closed" if the owner closes it.
+    // Expired/closed rides are excluded from search and can't take requests.
+    status: {
+      type: String,
+      enum: ["active", "expired", "closed"],
+      default: "active",
+      index: true,
+    },
 
     // # of times someone opened the connect page for this ride
     viewCount: { type: Number, default: 0 },

@@ -8,10 +8,72 @@ const router = express.Router();
 const Ride = require("../models/Ride");
 const User = require("../models/User");
 const Booking = require("../models/Booking");
+const Notification = require("../models/Notification");
+const RideRequest = require("../models/RideRequest");
 
 // ============================================================
 // HELPERS
 // ============================================================
+
+// ── Expiry helpers ──────────────────────────────────────────
+// A ride is expired once its date+time has passed, OR it's been
+// closed/expired explicitly. Enforced on the backend for search + direct
+// access so old posts can never be returned or requested.
+function rideDateTime(ride) {
+  if (!ride || !ride.date) return null;
+  const t = ride.time && /^\d{1,2}:\d{2}$/.test(ride.time) ? ride.time : "23:59";
+  const dt = new Date(`${ride.date}T${t}:00`);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+function isRideExpired(ride) {
+  if (!ride) return true;
+  if (ride.status === "closed" || ride.status === "expired") return true;
+  const dt = rideDateTime(ride);
+  if (!dt) return false; // no parseable datetime → don't hide it
+  return dt.getTime() < Date.now();
+}
+function rideStatusLabel(ride) {
+  if (ride.status === "closed") return "closed";
+  if (ride.status === "expired" || isRideExpired(ride)) return "expired";
+  return "active";
+}
+
+// Fire-and-forget notification creator.
+async function notify(userPhone, title, body, to) {
+  try {
+    if (!userPhone) return;
+    await Notification.create({
+      userPhone,
+      type: "info",
+      title: title || "",
+      body: body || "",
+      action: { to: to || "" },
+    });
+  } catch (e) { /* non-fatal */ }
+}
+
+// Throttled sweep: mark past-due active rides as expired and cascade their
+// still-pending requests → expired (notifying the riders). Runs at most once
+// per 60s so it doesn't add load to every request.
+let _lastSweep = 0;
+async function sweepExpiredRides() {
+  const now = Date.now();
+  if (now - _lastSweep < 60000) return;
+  _lastSweep = now;
+  try {
+    const actives = await Ride.find({ status: "active" }).select("_id date time from to");
+    for (const r of actives) {
+      if (!isRideExpired(r)) continue;
+      await Ride.updateOne({ _id: r._id }, { $set: { status: "expired" } });
+      const pend = await RideRequest.find({ rideId: r._id, status: "pending" });
+      for (const req of pend) {
+        await RideRequest.updateOne({ _id: req._id }, { $set: { status: "expired" } });
+        notify(req.riderPhone, "Ride expired",
+          `The ride ${r.from} → ${r.to} has expired, so your request was closed.`, "");
+      }
+    }
+  } catch (e) { /* non-fatal */ }
+}
 
 const todayStr = () => {
   const d = new Date();
@@ -179,7 +241,9 @@ const enrichRidesWithUser = async (rides) => {
 // ============================================================
 router.get("/", async (req, res) => {
   try {
-    const rides = await Ride.find().sort({ createdAt: -1 });
+    await sweepExpiredRides();
+    const rides = (await Ride.find({ status: { $ne: "closed" } }).sort({ createdAt: -1 }))
+      .filter((r) => !isRideExpired(r));
     const enriched = await enrichRidesWithUser(rides);
     return res.status(200).json({ success: true, count: enriched.length, data: enriched });
   } catch (err) {
@@ -275,6 +339,8 @@ router.get("/by-user", async (req, res) => {
           additionalInfo: r.additionalInfo || "",
           viewCount: r.viewCount || 0,
           createdAt: r.createdAt,
+          // Lifecycle status for the owner's history: active | expired | closed
+          status: rideStatusLabel(r),
         })),
       },
     });
@@ -406,6 +472,9 @@ router.get("/search", async (req, res) => {
       return { pass: txtOk || geoOk, dist: rankDist, exact: !!exact };
     };
 
+    // Never surface expired/closed rides, even to a direct search.
+    candidates = candidates.filter((r) => !isRideExpired(r));
+
     const scored = [];
     for (const r of candidates) {
       const fromR = evalField(fromT, fLat, fLon, hasFromGeo, r.fromLat, r.fromLon, r.from);
@@ -460,6 +529,15 @@ router.get("/:id/connect", async (req, res) => {
       });
     }
 
+    if (isRideExpired(ride)) {
+      return res.status(200).json({
+        success: true,
+        expired: true,
+        message: "This ride has expired or been closed",
+        data: { ride: { _id: ride._id, from: ride.from, to: ride.to, date: ride.date, time: ride.time, status: rideStatusLabel(ride) } },
+      });
+    }
+
     Ride.updateOne({ _id: id }, { $inc: { viewCount: 1 } }).catch(() => {});
 
     const user = await findUserByPhone(ride.userPhone);
@@ -500,7 +578,8 @@ router.get("/:id/connect", async (req, res) => {
           fullName: driverName,
           photo: user?.photo || "",
           city: user?.city || "",
-          maskedPhone: maskPhone(driverPhone),
+          // Contact is NOT exposed here — revealed only after the ride owner
+          // accepts the rider's request (see the /requests endpoints).
         },
       },
     });
@@ -537,6 +616,15 @@ router.get("/:id/details", async (req, res) => {
         success: false,
         error: "Ride not found",
         message: "Ride not found",
+      });
+    }
+
+    if (isRideExpired(ride)) {
+      return res.status(200).json({
+        success: true,
+        expired: true,
+        message: "This ride has expired or been closed",
+        data: { ride: { _id: ride._id, from: ride.from, to: ride.to, date: ride.date, time: ride.time, status: rideStatusLabel(ride) } },
       });
     }
 
@@ -591,6 +679,7 @@ router.get("/:id/details", async (req, res) => {
           additionalInfo: ride.additionalInfo || "",
           viewCount: ride.viewCount || 0,
           createdAt: ride.createdAt,
+          status: rideStatusLabel(ride),
         },
         driver: {
           fullName: user?.fullName?.trim() || "TravelMate Rider",
@@ -600,8 +689,8 @@ router.get("/:id/details", async (req, res) => {
           // Both forms — frontend can pick. RideDetail shows the
           // unmasked phone since the user has already paid by the
           // time they land on that page.
-          phone: driverPhone,
-          maskedPhone: maskPhone(driverPhone),
+          // Contact is NOT exposed publicly — revealed only after the ride
+          // owner accepts the rider's request (see the /requests endpoints).
           stats: {
             totalPostedRides,
             upcomingRides,
@@ -830,6 +919,218 @@ router.delete("/:id", async (req, res) => {
       error: err.message || "Internal server error",
       message: err.message || "Internal server error",
     });
+  }
+});
+
+// ============================================================
+// REQUEST TO RIDE — request / accept / reject / cancel / close
+// Contact is revealed only once a request is ACCEPTED.
+// ============================================================
+const phoneVariantsOf = (raw) => {
+  const s = String(raw || "").trim();
+  const last10 = s.replace(/\D/g, "").slice(-10);
+  const list = s ? [s] : [];
+  if (last10.length === 10) list.push("+91" + last10, "91" + last10, last10);
+  return [...new Set(list)];
+};
+const samePhone = (a, b) =>
+  phoneVariantsOf(a).some((v) => phoneVariantsOf(b).includes(v));
+
+// POST /api/rides/:id/request  { riderPhone, message? }
+router.post("/:id/request", async (req, res) => {
+  try {
+    const riderPhone = normalizePhone(req.body?.riderPhone || "");
+    const message = String(req.body?.message || "").slice(0, 300);
+    if (!riderPhone) return res.status(400).json({ success: false, message: "Rider phone is required" });
+
+    const ride = await Ride.findById(req.params.id);
+    if (!ride) return res.status(404).json({ success: false, message: "Ride not found" });
+    if (isRideExpired(ride)) return res.status(400).json({ success: false, message: "This ride has expired or been closed" });
+    if (samePhone(ride.userPhone, riderPhone)) {
+      return res.status(400).json({ success: false, message: "You can't request your own ride" });
+    }
+
+    const rider = await findUserByPhone(riderPhone);
+    let reqDoc = await RideRequest.findOne({ rideId: ride._id, riderPhone });
+    if (reqDoc && (reqDoc.status === "pending" || reqDoc.status === "accepted")) {
+      return res.status(409).json({ success: false, message: "You have already requested this ride", data: reqDoc });
+    }
+    const snap = {
+      posterPhone: ride.userPhone,
+      riderPhone,
+      riderName: rider?.fullName || "",
+      riderPhoto: rider?.photo || "",
+      riderCity: rider?.city || "",
+      message,
+      status: "pending",
+    };
+    if (reqDoc) { Object.assign(reqDoc, snap); await reqDoc.save(); }
+    else { reqDoc = await RideRequest.create({ rideId: ride._id, ...snap }); }
+
+    notify(ride.userPhone, "New ride request",
+      `${rider?.fullName || "A rider"} requested to join ${ride.from} → ${ride.to}.`, "/requests");
+
+    return res.status(201).json({ success: true, message: "Request sent", data: reqDoc });
+  } catch (err) {
+    if (err && err.code === 11000) {
+      return res.status(409).json({ success: false, message: "You have already requested this ride" });
+    }
+    console.error("createRideRequest error:", err);
+    return res.status(500).json({ success: false, message: "Server error while sending request" });
+  }
+});
+
+// GET /api/rides/requests/incoming?phone=  — requests for MY rides (owner)
+router.get("/requests/incoming", async (req, res) => {
+  try {
+    await sweepExpiredRides();
+    const variants = phoneVariantsOf(req.query.phone);
+    if (!variants.length) return res.status(400).json({ success: false, message: "phone is required" });
+    const reqs = await RideRequest.find({ posterPhone: { $in: variants } }).sort({ createdAt: -1 }).lean();
+    const rideIds = [...new Set(reqs.map((r) => String(r.rideId)))];
+    const rides = await Ride.find({ _id: { $in: rideIds } }).lean();
+    const rideMap = {}; rides.forEach((r) => { rideMap[String(r._id)] = r; });
+    const data = reqs.map((r) => {
+      const ride = rideMap[String(r.rideId)];
+      return {
+        _id: r._id, status: r.status, message: r.message,
+        // Rider contact only exposed to the owner once accepted.
+        rider: {
+          name: r.riderName, photo: r.riderPhoto, city: r.riderCity,
+          phone: r.status === "accepted" ? r.riderPhone : "",
+        },
+        ride: ride ? { _id: ride._id, from: ride.from, to: ride.to, date: ride.date, time: ride.time, status: rideStatusLabel(ride) } : null,
+        createdAt: r.createdAt,
+      };
+    });
+    return res.json({ success: true, count: data.length, data });
+  } catch (err) {
+    console.error("incomingRequests error:", err);
+    return res.status(500).json({ success: false, message: "Server error while loading requests" });
+  }
+});
+
+// GET /api/rides/requests/outgoing?phone=  — requests I SENT (rider)
+router.get("/requests/outgoing", async (req, res) => {
+  try {
+    await sweepExpiredRides();
+    const variants = phoneVariantsOf(req.query.phone);
+    if (!variants.length) return res.status(400).json({ success: false, message: "phone is required" });
+    const reqs = await RideRequest.find({ riderPhone: { $in: variants } }).sort({ createdAt: -1 }).lean();
+    const rideIds = [...new Set(reqs.map((r) => String(r.rideId)))];
+    const rides = await Ride.find({ _id: { $in: rideIds } }).lean();
+    const rideMap = {}; rides.forEach((r) => { rideMap[String(r._id)] = r; });
+    const data = [];
+    for (const r of reqs) {
+      const ride = rideMap[String(r.rideId)];
+      let owner = null;
+      if (r.status === "accepted" && ride) {
+        const u = await findUserByPhone(ride.userPhone);
+        // Contact revealed to the rider only after acceptance.
+        owner = { name: u?.fullName || "TravelMate Rider", phone: ride.userPhone, photo: u?.photo || "" };
+      }
+      data.push({
+        _id: r._id, status: r.status,
+        ride: ride ? { _id: ride._id, from: ride.from, to: ride.to, date: ride.date, time: ride.time, vehicle: ride.vehicle || "", status: rideStatusLabel(ride) } : null,
+        owner,
+        createdAt: r.createdAt,
+      });
+    }
+    return res.json({ success: true, count: data.length, data });
+  } catch (err) {
+    console.error("outgoingRequests error:", err);
+    return res.status(500).json({ success: false, message: "Server error while loading your requests" });
+  }
+});
+
+// POST /api/rides/requests/:reqId/accept  { ownerPhone }
+router.post("/requests/:reqId/accept", async (req, res) => {
+  try {
+    const reqDoc = await RideRequest.findById(req.params.reqId);
+    if (!reqDoc) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!samePhone(reqDoc.posterPhone, req.body?.ownerPhone)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+    const ride = await Ride.findById(reqDoc.rideId);
+    if (ride && isRideExpired(ride)) return res.status(400).json({ success: false, message: "Ride has expired or been closed" });
+    if (reqDoc.status !== "pending") return res.status(400).json({ success: false, message: `Request already ${reqDoc.status}` });
+    reqDoc.status = "accepted";
+    await reqDoc.save();
+    notify(reqDoc.riderPhone, "Request accepted",
+      `Your request for ${ride?.from || ""} → ${ride?.to || ""} was accepted — the ride is confirmed and contact is now available.`,
+      "/requests");
+    return res.json({ success: true, message: "Request accepted", data: reqDoc });
+  } catch (err) {
+    console.error("acceptRequest error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// POST /api/rides/requests/:reqId/reject  { ownerPhone }
+router.post("/requests/:reqId/reject", async (req, res) => {
+  try {
+    const reqDoc = await RideRequest.findById(req.params.reqId);
+    if (!reqDoc) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!samePhone(reqDoc.posterPhone, req.body?.ownerPhone)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+    if (reqDoc.status !== "pending") return res.status(400).json({ success: false, message: `Request already ${reqDoc.status}` });
+    reqDoc.status = "rejected";
+    await reqDoc.save();
+    const ride = await Ride.findById(reqDoc.rideId);
+    notify(reqDoc.riderPhone, "Request rejected",
+      `Your request for ${ride?.from || ""} → ${ride?.to || ""} was declined.`, "/requests");
+    return res.json({ success: true, message: "Request rejected", data: reqDoc });
+  } catch (err) {
+    console.error("rejectRequest error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// POST /api/rides/requests/:reqId/cancel  { riderPhone }  — rider cancels own
+router.post("/requests/:reqId/cancel", async (req, res) => {
+  try {
+    const reqDoc = await RideRequest.findById(req.params.reqId);
+    if (!reqDoc) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!samePhone(reqDoc.riderPhone, req.body?.riderPhone)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+    if (!["pending", "accepted"].includes(reqDoc.status)) {
+      return res.status(400).json({ success: false, message: `Request already ${reqDoc.status}` });
+    }
+    reqDoc.status = "cancelled";
+    await reqDoc.save();
+    const ride = await Ride.findById(reqDoc.rideId);
+    notify(reqDoc.posterPhone, "Request cancelled",
+      `A rider cancelled their request for ${ride?.from || ""} → ${ride?.to || ""}.`, "/requests");
+    return res.json({ success: true, message: "Request cancelled", data: reqDoc });
+  } catch (err) {
+    console.error("cancelRequest error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// POST /api/rides/:id/close  { ownerPhone }  — owner closes ride; cascade
+router.post("/:id/close", async (req, res) => {
+  try {
+    const ride = await Ride.findById(req.params.id);
+    if (!ride) return res.status(404).json({ success: false, message: "Ride not found" });
+    if (!samePhone(ride.userPhone, req.body?.ownerPhone)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+    ride.status = "closed";
+    await ride.save();
+    const pend = await RideRequest.find({ rideId: ride._id, status: { $in: ["pending", "accepted"] } });
+    for (const r of pend) {
+      r.status = "cancelled";
+      await r.save();
+      notify(r.riderPhone, "Ride closed",
+        `The ride ${ride.from} → ${ride.to} was closed by the owner, so your request was cancelled.`, "");
+    }
+    return res.json({ success: true, message: "Ride closed", data: { _id: ride._id, status: "closed" } });
+  } catch (err) {
+    console.error("closeRide error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 });
 
