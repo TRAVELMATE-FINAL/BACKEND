@@ -1121,23 +1121,9 @@ router.post("/:id/request", async (req, res) => {
       return res.status(400).json({ success: false, message: "You can't request your own ride" });
     }
 
-    // ── Find Ride gate ────────────────────────────────────────────────
-    // Requesting a ride requires an ACTIVE Find Ride Daily plan (₹1 / 24h).
-    // This is a separate subscription from the Post Ride plan. Enforced here
-    // so the request API can't be bypassed.
-    const findSub = await Subscription.findOne({
-      phone: { $in: phoneVariantsOf(riderPhone) },
-      purpose: "find",
-      status: "active",
-      endDate: { $gt: new Date() },
-    });
-    if (!findSub) {
-      return res.status(403).json({
-        success: false,
-        code: "NEED_FIND_PLAN",
-        message: "Activate the Find Ride Daily Plan (₹1 / 24 hours) to request rides.",
-      });
-    }
+    // Requesting a ride is FREE. Payment (the Find Ride Daily plan) happens
+    // only AFTER the driver accepts, via the "Pay Now" step — which then
+    // unlocks the contact and vehicle number for this confirmed booking.
 
     const rider = await findUserByPhone(riderPhone);
     let reqDoc = await RideRequest.findOne({ rideId: ride._id, riderPhone });

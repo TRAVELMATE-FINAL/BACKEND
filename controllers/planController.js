@@ -212,10 +212,12 @@ exports.createOrder = async (req, res) => {
       originalAmount = fee.dailyPrice;
       finalAmount = fee.dailyPrice;
     } else if (purpose === "booking") {
-      // Contact-unlock booking fee — admin unlock + processing fee.
+      // Pay-after-accept for a confirmed booking = the Find Ride Daily plan
+      // price (admin-configured). Paying it unlocks the contact + vehicle
+      // number for this booking. No coupons.
       const fee = await loadFindFee();
-      originalAmount = fee.unlockFee + fee.processingFee;
-      finalAmount = originalAmount;
+      originalAmount = fee.dailyPrice;
+      finalAmount = fee.dailyPrice;
     } else {
       // Post Ride plan — admin catalog price (+ coupon if any).
       originalAmount = catalog[plan].price;
