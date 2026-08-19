@@ -4,12 +4,14 @@
 
 const express = require("express");
 const router = express.Router();
+const crypto = require("crypto");
 
 const Ride = require("../models/Ride");
 const User = require("../models/User");
 const Booking = require("../models/Booking");
 const Notification = require("../models/Notification");
 const RideRequest = require("../models/RideRequest");
+const planCtrl = require("../controllers/planController");
 
 // ============================================================
 // HELPERS
@@ -190,6 +192,26 @@ router.post("/", async (req, res) => {
     // makes the driver-name lookup on /details / /connect deterministic.
     const normalizedUserPhone = normalizePhone(userPhone);
 
+    // ── Duplicate-ride guard ─────────────────────────────────────────
+    // The SAME user may not have two ACTIVE rides at the same date + time.
+    // Independent of vehicle / from / to / seats. Different users, different
+    // times or different dates are all allowed. Closed/expired rides (e.g. a
+    // ride the owner previously cancelled) do NOT block a fresh post.
+    const DUP_MSG =
+      "You already have a ride scheduled for this date and time. Please choose a different date or time.";
+    if (normalizedUserPhone) {
+      const dupVariants = phoneVariantsOf(normalizedUserPhone);
+      const clash = await Ride.findOne({
+        userPhone: { $in: dupVariants.length ? dupVariants : [normalizedUserPhone] },
+        date,
+        time,
+        status: "active",
+      }).lean();
+      if (clash) {
+        return res.status(409).json({ success: false, error: DUP_MSG, message: DUP_MSG });
+      }
+    }
+
     const ride = await Ride.create({
       from: from.trim(),
       to: to.trim(),
@@ -217,6 +239,14 @@ router.post("/", async (req, res) => {
       data: ride,
     });
   } catch (err) {
+    // Race protection: the partial unique index (userPhone+date+time, active
+    // only) rejects a second simultaneous insert with a duplicate-key error.
+    // Surface the same professional message the pre-check uses.
+    if (err && err.code === 11000) {
+      const DUP_MSG =
+        "You already have a ride scheduled for this date and time. Please choose a different date or time.";
+      return res.status(409).json({ success: false, error: DUP_MSG, message: DUP_MSG });
+    }
     if (err.name === "ValidationError") {
       const messages = Object.values(err.errors).map((e) => e.message);
       return res.status(400).json({ success: false, error: messages.join(", "), message: messages.join(", ") });
@@ -1096,6 +1126,8 @@ router.get("/requests/incoming", async (req, res) => {
       const ride = rideMap[String(r.rideId)];
       return {
         _id: r._id, status: r.status, message: r.message,
+        paymentStatus: r.paymentStatus || "none",
+        amountPaid: r.amountPaid || 0,
         // Rider contact only exposed to the owner once accepted.
         rider: {
           name: r.riderName, photo: r.riderPhoto, city: r.riderCity,
@@ -1133,6 +1165,11 @@ router.get("/requests/outgoing", async (req, res) => {
       }
       data.push({
         _id: r._id, status: r.status,
+        // Payment state travels alongside booking state so the UI can show
+        // "Pay Now" for a CONFIRMED-but-unpaid booking (independent of seats).
+        paymentStatus: r.paymentStatus || "none",
+        amountDue: r.amountDue || 0,
+        amountPaid: r.amountPaid || 0,
         ride: ride ? { _id: ride._id, from: ride.from, to: ride.to, date: ride.date, time: ride.time, vehicle: ride.vehicle || "", status: rideStatusLabel(ride) } : null,
         owner,
         createdAt: r.createdAt,
@@ -1232,6 +1269,138 @@ router.post("/requests/:reqId/cancel", async (req, res) => {
   } catch (err) {
     console.error("cancelRequest error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ============================================================
+// BOOKING PAYMENT — charged to the RIDER only AFTER the driver confirms
+// (status === "accepted"). Seat availability does NOT gate this: a confirmed
+// rider can always pay even if the ride is now full. Amount = admin find-fee.
+// ============================================================
+
+// POST /api/rides/requests/:reqId/pay-order  { riderPhone }
+// Creates (or safely re-returns) a Razorpay order for a confirmed booking.
+// Idempotent: refresh / reopen returns the SAME pending order — no duplicates.
+router.post("/requests/:reqId/pay-order", async (req, res) => {
+  try {
+    const reqDoc = await RideRequest.findById(req.params.reqId);
+    if (!reqDoc) return res.status(404).json({ success: false, message: "Booking not found" });
+    if (!samePhone(reqDoc.riderPhone, req.body?.riderPhone)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+    if (reqDoc.status !== "accepted") {
+      return res.status(400).json({ success: false, message: "Payment becomes available once the driver confirms your booking." });
+    }
+    // Already paid — nothing to do (refresh-safe).
+    if (reqDoc.paymentStatus === "paid") {
+      return res.json({ success: true, alreadyPaid: true, paymentStatus: "paid", bookingId: reqDoc._id, rideId: reqDoc.rideId });
+    }
+
+    const client = planCtrl.getRazorpayClient();
+    if (!client) return res.status(500).json({ success: false, message: "Payment is temporarily unavailable. Please try again later." });
+
+    const feeRupees = await planCtrl.loadBookingFee();
+    const KEY = process.env.RAZORPAY_KEY_ID;
+
+    // Reuse an existing pending order so a refresh/retry can't spawn duplicates.
+    if (reqDoc.paymentOrderId) {
+      try {
+        const existing = await client.orders.fetch(reqDoc.paymentOrderId);
+        if (existing && existing.status !== "paid") {
+          return res.json({
+            success: true,
+            orderId: existing.id, key: KEY,
+            amount: existing.amount, currency: existing.currency,
+            amountRupees: existing.amount / 100,
+            bookingId: reqDoc._id, rideId: reqDoc.rideId,
+            paymentStatus: "pending",
+          });
+        }
+      } catch (_e) { /* fall through and create a fresh order */ }
+    }
+
+    const order = await client.orders.create({
+      amount: Math.round(feeRupees * 100),
+      currency: "INR",
+      receipt: "bk_" + String(reqDoc._id).slice(-16) + "_" + Date.now(),
+      notes: { bookingId: String(reqDoc._id), rideId: String(reqDoc.rideId), riderPhone: reqDoc.riderPhone },
+    });
+
+    reqDoc.paymentOrderId = order.id;
+    reqDoc.paymentStatus = "pending";
+    reqDoc.amountDue = feeRupees;
+    await reqDoc.save();
+
+    return res.json({
+      success: true,
+      orderId: order.id, key: KEY,
+      amount: order.amount, currency: order.currency,
+      amountRupees: feeRupees,
+      bookingId: reqDoc._id, rideId: reqDoc.rideId,
+      paymentStatus: "pending",
+    });
+  } catch (err) {
+    console.error("bookingPayOrder error:", err);
+    return res.status(500).json({ success: false, message: "Could not start payment. Please try again." });
+  }
+});
+
+// POST /api/rides/requests/:reqId/pay-verify
+//   { riderPhone, razorpay_order_id, razorpay_payment_id, razorpay_signature }
+// Verifies the Razorpay signature and marks the booking PAID. Idempotent.
+router.post("/requests/:reqId/pay-verify", async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    const reqDoc = await RideRequest.findById(req.params.reqId);
+    if (!reqDoc) return res.status(404).json({ success: false, message: "Booking not found" });
+    if (!samePhone(reqDoc.riderPhone, req.body?.riderPhone)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+    // Already verified — return success so a double-submit is harmless.
+    if (reqDoc.paymentStatus === "paid") {
+      return res.json({ success: true, alreadyPaid: true, paymentStatus: "paid" });
+    }
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ success: false, message: "Missing payment confirmation details" });
+    }
+
+    const expected = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest("hex");
+    if (expected !== razorpay_signature) {
+      reqDoc.paymentStatus = "failed";
+      await reqDoc.save();
+      return res.status(401).json({ success: false, message: "Payment could not be verified. If money was deducted, it will be auto-refunded." });
+    }
+
+    let amountPaid = reqDoc.amountDue || 0;
+    try {
+      const client = planCtrl.getRazorpayClient();
+      if (client) {
+        const o = await client.orders.fetch(razorpay_order_id);
+        if (o && o.amount) amountPaid = o.amount / 100;
+      }
+    } catch (_e) { /* non-fatal */ }
+
+    reqDoc.paymentStatus = "paid";
+    reqDoc.paymentId = razorpay_payment_id;
+    reqDoc.amountPaid = amountPaid;
+    reqDoc.paidAt = new Date();
+    await reqDoc.save();
+
+    const ride = await Ride.findById(reqDoc.rideId).lean();
+    notify(reqDoc.riderPhone, "Payment Successful",
+      `Your payment for the ride${ride ? ` from ${ride.from} to ${ride.to}` : ""} is complete. Your booking is confirmed.`,
+      "/requests");
+    notify(reqDoc.posterPhone, "Booking Payment Received",
+      `A confirmed passenger has completed their payment${ride ? ` for your ride from ${ride.from} to ${ride.to}` : ""}.`,
+      "/requests");
+
+    return res.json({ success: true, paymentStatus: "paid", data: { _id: reqDoc._id, paymentStatus: "paid", amountPaid } });
+  } catch (err) {
+    console.error("bookingPayVerify error:", err);
+    return res.status(500).json({ success: false, message: "Payment verification failed. Please try again." });
   }
 });
 

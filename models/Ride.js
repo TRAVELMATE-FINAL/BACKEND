@@ -72,4 +72,18 @@ const rideSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// ── Duplicate-ride protection (DB level) ──────────────────────────────
+// A single user (userPhone) may only have ONE ACTIVE ride at a given
+// date + time. The partial filter means CLOSED / EXPIRED rides are ignored,
+// so a user can re-post at the same slot after cancelling/closing an old one,
+// and different users can post at the same date+time. This also guards
+// against a race where two simultaneous requests both pass the app-level
+// pre-check: the second insert fails with a duplicate-key (E11000) error.
+// NOTE: userPhone is always normalized to "+91XXXXXXXXXX" before insert, so
+// the index key is consistent.
+rideSchema.index(
+  { userPhone: 1, date: 1, time: 1 },
+  { unique: true, partialFilterExpression: { status: "active" } }
+);
+
 module.exports = mongoose.model("Ride", rideSchema);

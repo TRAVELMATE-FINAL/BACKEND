@@ -24,6 +24,21 @@ const rideRequestSchema = new mongoose.Schema(
       default: "pending",
       index: true,
     },
+
+    // ── Payment (booking fee, charged AFTER the driver confirms) ────────
+    // Kept independent of `status` so a CONFIRMED booking can still be
+    // PENDING payment. Only meaningful once status === "accepted".
+    paymentStatus: {
+      type: String,
+      enum: ["none", "pending", "paid", "failed"],
+      default: "none",
+      index: true,
+    },
+    paymentOrderId: { type: String, default: "" }, // Razorpay order id (reused on retry)
+    paymentId:      { type: String, default: "" }, // Razorpay payment id (set on success)
+    amountDue:      { type: Number, default: 0 },   // rupees the rider must pay
+    amountPaid:     { type: Number, default: 0 },   // rupees actually charged
+    paidAt:         { type: Date,   default: null },
   },
   { timestamps: true }
 );

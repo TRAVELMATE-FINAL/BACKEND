@@ -437,6 +437,20 @@ exports.ensureCouponsSeeded = async () => {
   }
 };
 
+// ── Shared primitives for the ride-booking payment flow ───────────────
+// The ride-booking "Pay Now" step (charged after the driver confirms) reuses
+// the SAME Razorpay client and the SAME admin-set find-ride fee, so the
+// amount stays centrally controlled from the admin panel.
+exports.getRazorpayClient = getRazorpay;
+
+// Booking fee in rupees = admin unlockFee + processingFee (min 1).
+exports.loadBookingFee = async () => {
+  const f = await loadFindFee();
+  const total = num(f.unlockFee, DEFAULTS.findRide.unlockFee) +
+                num(f.processingFee, DEFAULTS.findRide.processingFee);
+  return Math.max(1, total);
+};
+
 // Compatibility export (defaults only; live values come from the DB).
 exports.PLAN_META = PLAN_META;
 exports.DEFAULT_PRICING = DEFAULTS;
