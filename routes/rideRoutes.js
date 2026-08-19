@@ -1240,7 +1240,7 @@ router.post("/requests/:reqId/accept", async (req, res) => {
     }
     notify(updated.riderPhone, "Ride Request Accepted",
       `Your request has been accepted. You can now view the permitted contact details for this confirmed ride.`,
-      "/requests");
+      "/requests?tab=sent");
     return res.json({ success: true, message: "Request accepted", data: updated });
   } catch (err) {
     console.error("acceptRequest error:", err);
@@ -1261,7 +1261,7 @@ router.post("/requests/:reqId/reject", async (req, res) => {
     await reqDoc.save();
     const ride = await Ride.findById(reqDoc.rideId);
     notify(reqDoc.riderPhone, "Ride Request Update",
-      `Your request to join the ride was not accepted by the ride owner.`, "/requests");
+      `Your request to join the ride was not accepted by the ride owner.`, "/requests?tab=sent");
     return res.json({ success: true, message: "Request rejected", data: reqDoc });
   } catch (err) {
     console.error("rejectRequest error:", err);
@@ -1412,7 +1412,7 @@ router.post("/requests/:reqId/pay-verify", async (req, res) => {
     const ride = await Ride.findById(reqDoc.rideId).lean();
     notify(reqDoc.riderPhone, "Payment Successful",
       `Your payment for the ride${ride ? ` from ${ride.from} to ${ride.to}` : ""} is complete. Your booking is confirmed.`,
-      "/requests");
+      "/requests?tab=sent");
     notify(reqDoc.posterPhone, "Booking Payment Received",
       `A confirmed passenger has completed their payment${ride ? ` for your ride from ${ride.from} to ${ride.to}` : ""}.`,
       "/requests");
@@ -1465,7 +1465,7 @@ router.post("/requests/mark-paid", async (req, res) => {
       const ride = await Ride.findById(rideId).lean();
       notify(reqDoc.riderPhone, "Payment Successful",
         `Your payment is complete${ride ? ` for the ride from ${ride.from} to ${ride.to}` : ""}. The contact details are now available.`,
-        "/requests");
+        "/requests?tab=sent");
     }
     return res.json({ success: true, paymentStatus: "paid", bookingId: reqDoc._id });
   } catch (err) {
