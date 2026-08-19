@@ -54,15 +54,23 @@ async function notify(userPhone, title, body, to) {
   } catch (e) { /* non-fatal */ }
 }
 
-// Strip contact info (phone numbers, emails) from public-facing notes so a
-// number typed into "Notes & preferences" is never exposed publicly. Contact
-// is only shared after an accepted Request to Ride.
+// Strip ONLY contact info (phone numbers, emails) from the notes while keeping
+// the rest of the poster's preferences intact and readable. The real
+// preferences (e.g. "AC car, No smoking, Pet friendly") are shown as-is; any
+// phone/email typed into the field is removed entirely (no visible marker) so
+// contact is never leaked here — it's shared only after payment.
 function sanitizeNotes(text) {
   if (!text) return "";
   let out = String(text);
-  out = out.replace(/\+?\d[\d\s\-().]{7,}\d/g, "[contact hidden]"); // phone-like
-  out = out.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "[contact hidden]"); // emails
-  return out.replace(/\s{2,}/g, " ").trim();
+  out = out.replace(/\+?\d[\d\s\-().]{7,}\d/g, " "); // remove phone-like numbers
+  out = out.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, " "); // remove emails
+  // Re-tidy into clean comma/newline-separated fragments, dropping any empties
+  // left behind by the removal so there's no dangling punctuation.
+  const parts = out
+    .split(/[\n,]+/)
+    .map((s) => s.replace(/\s{2,}/g, " ").trim())
+    .filter(Boolean);
+  return parts.join(", ");
 }
 
 // Throttled sweep: mark past-due active rides as expired and cascade their
@@ -902,10 +910,22 @@ router.post("/:id/unlock", async (req, res) => {
       }
     }
 
+    // SECURITY: only return the real driver number when the caller has a
+    // CONFIRMED + PAID booking for this ride. Without it, the booking is still
+    // logged (side effect above) but no contact is returned.
+    const paidReq = riderPhone
+      ? await RideRequest.findOne({
+          rideId: ride._id,
+          riderPhone: { $in: phoneVariantsOf(riderPhone) },
+          status: "accepted",
+          paymentStatus: "paid",
+        })
+      : null;
+
     return res.status(200).json({
       success: true,
-      message: "Contact unlocked",
-      data: { phone: ride.userPhone },
+      message: paidReq ? "Contact unlocked" : "Contact locked until payment",
+      data: { phone: paidReq ? ride.userPhone : "" },
     });
   } catch (err) {
     if (err.name === "CastError") {
