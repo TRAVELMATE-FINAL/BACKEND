@@ -46,9 +46,12 @@ const corsOptions = {
   },
   credentials: true,
 };
+// cors() applied globally here ALSO answers OPTIONS preflight for every
+// route automatically. Do NOT add an explicit app.options("*", ...): on
+// Express 5 / path-to-regexp v8, "*" is no longer a valid path pattern and
+// throws "Missing parameter name at index 1: *" at boot, which crashes the
+// whole server before it can listen.
 app.use(cors(corsOptions));
-// Answer preflight (OPTIONS) for every route with the same policy.
-app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
