@@ -3,6 +3,10 @@ const mongoose = require("mongoose");
 const subscriptionSchema = new mongoose.Schema(
   {
     phone:    { type: String, required: true, index: true, trim: true },
+    // What this subscription unlocks: "post" (posting rides — daily/monthly/
+    // yearly) or "find" (Find Ride requesting — daily only). Kept separate so
+    // a Post plan never grants Find access and vice versa.
+    purpose:  { type: String, enum: ["post", "find"], default: "post", index: true },
     plan:     { type: String, enum: ["daily", "monthly", "yearly"], required: true },
     startDate:{ type: Date, default: Date.now, required: true },
     endDate:  { type: Date, required: true, index: true },

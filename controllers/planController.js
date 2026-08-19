@@ -17,7 +17,8 @@ const DEFAULTS = {
   daily:   { price: 30,   durationDays: 1 },
   monthly: { price: 650,  durationDays: 30 },
   yearly:  { price: 1200, durationDays: 365 },
-  findRide:{ unlockFee: 49, processingFee: 1 },
+  // Find Ride has its OWN daily price, separate from the Post Ride daily price.
+  findRide:{ unlockFee: 49, processingFee: 1, dailyPrice: 1 },
 };
 
 const num = (v, fallback) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : fallback);
@@ -52,6 +53,8 @@ async function loadFindFee() {
   return {
     unlockFee: num(f.unlockFee, DEFAULTS.findRide.unlockFee),
     processingFee: num(f.processingFee, DEFAULTS.findRide.processingFee),
+    // Find Ride Daily plan price — separate admin field from Post Ride Daily.
+    dailyPrice: num(f.dailyPrice, DEFAULTS.findRide.dailyPrice),
   };
 }
 
@@ -116,10 +119,11 @@ exports.getMySubscription = async (req, res) => {
   try {
     const phone = normPhone(req.query.phone);
     if (!phone) return res.status(400).json({ message: "Valid phone is required" });
+    const purposeQ = req.query.purpose === "find" ? "find" : { $ne: "find" };
 
     const now = new Date();
     const sub = await Subscription.findOne({
-      phone, status: "active", endDate: { $gt: now },
+      phone, purpose: purposeQ, status: "active", endDate: { $gt: now },
     }).sort({ endDate: -1 });
 
     if (!sub) {
@@ -187,30 +191,46 @@ exports.applyCoupon = async (req, res) => {
 exports.createOrder = async (req, res) => {
   try {
     const { plan, couponCode, amount: clientAmountPaise } = req.body;
+    const purpose = ["find", "booking"].includes(req.body.purpose) ? req.body.purpose : "post";
     const phone = normPhone(req.body.phone);
     if (!phone) return res.status(400).json({ message: "Valid phone is required" });
     const catalog = await loadCatalog();
     if (!catalog[plan]) return res.status(400).json({ message: "Invalid plan" });
+    // Find Ride has ONLY the Daily plan.
+    if (purpose === "find" && plan !== "daily") {
+      return res.status(400).json({ message: "Find Ride supports only the Daily plan" });
+    }
 
-    const originalAmount = catalog[plan].price;
-    let cashback = 0;
-    let finalAmount = originalAmount;
-    let coupon = null;
-
-    if (couponCode) {
-      coupon = await Coupon.findOne({ code: String(couponCode).toUpperCase().trim() });
-      if (coupon) {
-        const valid = coupon.isValidNow(plan);
-        if (!valid.ok) return res.status(400).json({ message: valid.reason });
-        cashback = coupon.computeCashback(originalAmount);
-        finalAmount = Math.max(0, originalAmount - cashback);
+    // ── Amount resolution (backend is authoritative) ─────────────────
+    // The price ALWAYS comes from the admin config for the given purpose —
+    // the client-sent amount is ignored, so a user can't manipulate what they
+    // pay. Coupons apply to Post plans only.
+    let originalAmount, finalAmount, cashback = 0, coupon = null;
+    if (purpose === "find") {
+      // Find Ride Daily — its own admin price, no coupons.
+      const fee = await loadFindFee();
+      originalAmount = fee.dailyPrice;
+      finalAmount = fee.dailyPrice;
+    } else if (purpose === "booking") {
+      // Contact-unlock booking fee — admin unlock + processing fee.
+      const fee = await loadFindFee();
+      originalAmount = fee.unlockFee + fee.processingFee;
+      finalAmount = originalAmount;
+    } else {
+      // Post Ride plan — admin catalog price (+ coupon if any).
+      originalAmount = catalog[plan].price;
+      finalAmount = originalAmount;
+      if (couponCode) {
+        coupon = await Coupon.findOne({ code: String(couponCode).toUpperCase().trim() });
+        if (coupon) {
+          const valid = coupon.isValidNow(plan);
+          if (!valid.ok) return res.status(400).json({ message: valid.reason });
+          cashback = coupon.computeCashback(originalAmount);
+          finalAmount = Math.max(0, originalAmount - cashback);
+        }
       }
     }
-
-    // Fixed-fee pages (UnlockContact) send an explicit amount in paise.
-    if (clientAmountPaise && Number(clientAmountPaise) > 0) {
-      finalAmount = Math.round(Number(clientAmountPaise)) / 100;
-    }
+    // NOTE: `clientAmountPaise` is intentionally NOT trusted — do not use it.
 
     const client = getRazorpay();
     if (!client) {
@@ -221,7 +241,7 @@ exports.createOrder = async (req, res) => {
       amount: Math.round(finalAmount * 100),
       currency: "INR",
       receipt: "rcpt_" + Date.now() + "_" + plan,
-      notes: { phone, plan, couponCode: couponCode || "" },
+      notes: { phone, plan, purpose, couponCode: couponCode || "" },
     });
 
     res.json({
@@ -230,6 +250,7 @@ exports.createOrder = async (req, res) => {
       amount: order.amount,
       currency: order.currency,
       plan,
+      purpose,
       originalAmount,
       cashback,
       finalAmount,
@@ -253,11 +274,15 @@ exports.verifyPayment = async (req, res) => {
       plan,
       couponCode = "",
     } = req.body;
+    const purpose = ["find", "booking"].includes(req.body.purpose) ? req.body.purpose : "post";
     const phone = normPhone(req.body.phone);
 
     const catalog = await loadCatalog();
     if (!phone || !catalog[plan]) {
       return res.status(400).json({ message: "Phone and valid plan are required" });
+    }
+    if (purpose === "find" && plan !== "daily") {
+      return res.status(400).json({ message: "Find Ride supports only the Daily plan" });
     }
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ message: "Missing Razorpay fields" });
@@ -270,6 +295,13 @@ exports.verifyPayment = async (req, res) => {
 
     if (expectedSignature !== razorpay_signature) {
       return res.status(401).json({ message: "Invalid Razorpay signature" });
+    }
+
+    // Booking (contact-unlock) payment does NOT create a subscription — the
+    // caller (UnlockContact) marks the specific booking paid via
+    // /api/rides/requests/mark-paid. Just confirm the payment is genuine.
+    if (purpose === "booking") {
+      return res.json({ ok: true, purpose: "booking", message: "Payment verified" });
     }
 
     const originalAmount = catalog[plan].price;
@@ -297,16 +329,43 @@ exports.verifyPayment = async (req, res) => {
       // Non-fatal
     }
 
-    const startDate = new Date();
-    const endDate = new Date(startDate.getTime() + catalog[plan].durationDays * 24 * 60 * 60 * 1000);
+    // ── Idempotency ──────────────────────────────────────────────────
+    // If this exact Razorpay payment was already processed (duplicate
+    // callback / double-submit / refresh), return the existing subscription
+    // instead of creating a duplicate or re-extending the plan.
+    const already = await Subscription.findOne({ razorpayPaymentId: razorpay_payment_id });
+    if (already) {
+      return res.json({
+        ok: true,
+        message: "Payment already processed",
+        subscription: {
+          plan: already.plan,
+          startDate: already.startDate,
+          endDate: already.endDate,
+          amountPaid: already.amountPaid,
+        },
+      });
+    }
 
+    // ── Activation window (from the actual successful-payment time) ──────
+    // Find Ride: always Daily = +24h. Post Ride: Daily +24h / Monthly +1
+    // calendar month / Yearly +1 calendar year. Not hardcoded — from `now`.
+    const startDate = new Date();
+    const endDate = new Date(startDate);
+    if (purpose === "find" || plan === "daily") endDate.setDate(endDate.getDate() + 1);
+    else if (plan === "monthly") endDate.setMonth(endDate.getMonth() + 1);
+    else if (plan === "yearly")  endDate.setFullYear(endDate.getFullYear() + 1);
+    else endDate.setTime(startDate.getTime() + catalog[plan].durationDays * 24 * 60 * 60 * 1000);
+
+    // Expire only the SAME-purpose active subs (find and post are independent).
     await Subscription.updateMany(
-      { phone, status: "active" },
+      { phone, status: "active", purpose },
       { $set: { status: "expired" } }
     );
 
     const sub = await Subscription.create({
       phone,
+      purpose,
       plan,
       startDate,
       endDate,
@@ -356,7 +415,7 @@ exports.canPostRide = async (req, res) => {
 
     const now = new Date();
     const sub = await Subscription.findOne({
-      phone, status: "active", endDate: { $gt: now },
+      phone, purpose: { $ne: "find" }, status: "active", endDate: { $gt: now },
     }).sort({ endDate: -1 });
 
     if (!sub) return res.json({ canPostRide: false, reason: "No active subscription" });
@@ -365,6 +424,28 @@ exports.canPostRide = async (req, res) => {
     res.json({ canPostRide: true, plan: sub.plan, daysLeft, endDate: sub.endDate });
   } catch (err) {
     console.error("canPostRide error:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ===========================================================
+// GET /api/plans/can-find?phone=+91...  — Find Ride Daily plan gate.
+// ===========================================================
+exports.canFindRide = async (req, res) => {
+  try {
+    const phone = normPhone(req.query.phone);
+    if (!phone) return res.status(400).json({ message: "Valid phone is required" });
+
+    const now = new Date();
+    const sub = await Subscription.findOne({
+      phone, purpose: "find", status: "active", endDate: { $gt: now },
+    }).sort({ endDate: -1 });
+
+    if (!sub) return res.json({ canFindRide: false, reason: "No active Find Ride plan" });
+
+    res.json({ canFindRide: true, plan: sub.plan, endDate: sub.endDate });
+  } catch (err) {
+    console.error("canFindRide error:", err);
     res.status(500).json({ message: err.message });
   }
 };

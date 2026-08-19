@@ -7,6 +7,7 @@ router.get("/",            ctrl.getPlans);          // catalogue
 router.get("/find-fee",    ctrl.getFindFee);        // live unlock + processing fee
 router.get("/me",          ctrl.getMySubscription); // active sub for a phone
 router.get("/can-post",    ctrl.canPostRide);       // post-ride gate
+router.get("/can-find",    ctrl.canFindRide);       // find-ride (request) gate
 
 router.get("/coupon/list",   ctrl.listCoupons);     // list active coupons (chips on SecurePayment)
 router.post("/coupon/apply", ctrl.applyCoupon);     // validate + compute cashback

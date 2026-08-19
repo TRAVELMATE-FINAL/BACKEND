@@ -11,6 +11,7 @@ const User = require("../models/User");
 const Booking = require("../models/Booking");
 const Notification = require("../models/Notification");
 const RideRequest = require("../models/RideRequest");
+const Subscription = require("../models/Subscription");
 const planCtrl = require("../controllers/planController");
 
 // ============================================================
@@ -217,6 +218,29 @@ router.post("/", async (req, res) => {
       }).lean();
       if (clash) {
         return res.status(409).json({ success: false, error: DUP_MSG, message: DUP_MSG });
+      }
+    }
+
+    // ── Posting subscription gate ─────────────────────────────────────
+    // A user must hold an ACTIVE posting plan (daily/monthly/yearly) to post.
+    // Enforced here so the API can't be bypassed by calling it directly. This
+    // affects POSTING only — finding, requesting, and paying for a confirmed
+    // booking are never blocked by this.
+    if (normalizedUserPhone) {
+      const subVariants = phoneVariantsOf(normalizedUserPhone);
+      const activeSub = await Subscription.findOne({
+        phone: { $in: subVariants.length ? subVariants : [normalizedUserPhone] },
+        purpose: { $ne: "find" }, // "post" or legacy subs without a purpose field
+        status: "active",
+        endDate: { $gt: new Date() },
+      });
+      if (!activeSub) {
+        return res.status(403).json({
+          success: false,
+          code: "NO_ACTIVE_PLAN",
+          error: "No active posting plan. Please choose a plan to continue posting rides.",
+          message: "No active posting plan. Please choose a plan to continue posting rides.",
+        });
       }
     }
 
@@ -1095,6 +1119,24 @@ router.post("/:id/request", async (req, res) => {
     if (isRideExpired(ride)) return res.status(400).json({ success: false, message: "This ride has expired or been closed" });
     if (samePhone(ride.userPhone, riderPhone)) {
       return res.status(400).json({ success: false, message: "You can't request your own ride" });
+    }
+
+    // ── Find Ride gate ────────────────────────────────────────────────
+    // Requesting a ride requires an ACTIVE Find Ride Daily plan (₹1 / 24h).
+    // This is a separate subscription from the Post Ride plan. Enforced here
+    // so the request API can't be bypassed.
+    const findSub = await Subscription.findOne({
+      phone: { $in: phoneVariantsOf(riderPhone) },
+      purpose: "find",
+      status: "active",
+      endDate: { $gt: new Date() },
+    });
+    if (!findSub) {
+      return res.status(403).json({
+        success: false,
+        code: "NEED_FIND_PLAN",
+        message: "Activate the Find Ride Daily Plan (₹1 / 24 hours) to request rides.",
+      });
     }
 
     const rider = await findUserByPhone(riderPhone);
