@@ -234,7 +234,45 @@ router.post("/", async (req, res) => {
 // Helper — attach the poster's User profile (fullName + photo)
 // to every ride so the FindFriends card can render real avatars.
 // ============================================================
+// ── Seat availability ────────────────────────────────────────────────
+// A seat is "occupied" ONLY by a CONFIRMED (accepted) request. Pending,
+// rejected, cancelled and expired requests never consume a seat. If a
+// confirmed rider later cancels, their request becomes "cancelled" and the
+// seat frees automatically because we only ever count status === "accepted".
+const CONFIRMED_STATUS = "accepted"; // "accepted" == CONFIRMED in this codebase
+
+// Count confirmed requests for a single ride.
+async function confirmedCountForRide(rideId) {
+  return RideRequest.countDocuments({ rideId, status: CONFIRMED_STATUS });
+}
+
+// Batch: Map<rideId(string), confirmedCount> for a list of rides.
+async function confirmedCountsFor(rideIds) {
+  if (!rideIds || !rideIds.length) return new Map();
+  const rows = await RideRequest.aggregate([
+    { $match: { rideId: { $in: rideIds }, status: CONFIRMED_STATUS } },
+    { $group: { _id: "$rideId", n: { $sum: 1 } } },
+  ]);
+  const map = new Map();
+  rows.forEach((r) => map.set(String(r._id), r.n));
+  return map;
+}
+
+// Attach seat fields to a plain ride object. remainingSeats never goes below 0.
+function attachSeatInfo(obj, confirmedCount) {
+  const total = typeof obj.seatsAvailable === "number" ? obj.seatsAvailable : 1;
+  const confirmed = confirmedCount || 0;
+  const remaining = Math.max(0, total - confirmed);
+  obj.totalSeats = total;
+  obj.confirmedSeats = confirmed;
+  obj.remainingSeats = remaining;
+  obj.seatsLeft = remaining; // alias for older frontend field names
+  obj.isFull = remaining <= 0;
+  return obj;
+}
+
 const enrichRidesWithUser = async (rides) => {
+  const counts = await confirmedCountsFor(rides.map((r) => r._id));
   const out = [];
   for (const r of rides) {
     const user = await findUserByPhone(r.userPhone);
@@ -244,6 +282,8 @@ const enrichRidesWithUser = async (rides) => {
     obj.driverCity = user?.city || "";
     // Never expose a phone/email typed into notes in public ride lists.
     obj.additionalInfo = sanitizeNotes(obj.additionalInfo);
+    // Seat availability based on CONFIRMED requests only.
+    attachSeatInfo(obj, counts.get(String(r._id)) || 0);
     out.push(obj);
   }
   return out;
@@ -307,6 +347,8 @@ router.get("/by-user", async (req, res) => {
       (sum, r) => sum + (typeof r.seatsAvailable === "number" ? r.seatsAvailable : 0),
       0
     );
+    // Confirmed-seat counts for each of the owner's rides (accepted requests).
+    const seatCounts = await confirmedCountsFor(rides.map((r) => r._id));
 
     return res.status(200).json({
       success: true,
@@ -349,6 +391,17 @@ router.get("/by-user", async (req, res) => {
           vehicleColor: r.vehicleColor || "",
           plateNumber: r.plateNumber || "",
           seatsAvailable: typeof r.seatsAvailable === "number" ? r.seatsAvailable : 1,
+          totalSeats: typeof r.seatsAvailable === "number" ? r.seatsAvailable : 1,
+          confirmedSeats: seatCounts.get(String(r._id)) || 0,
+          remainingSeats: Math.max(
+            0,
+            (typeof r.seatsAvailable === "number" ? r.seatsAvailable : 1) -
+              (seatCounts.get(String(r._id)) || 0)
+          ),
+          isFull:
+            (typeof r.seatsAvailable === "number" ? r.seatsAvailable : 1) -
+              (seatCounts.get(String(r._id)) || 0) <=
+            0,
           additionalInfo: r.additionalInfo || "",
           viewCount: r.viewCount || 0,
           createdAt: r.createdAt,
@@ -570,6 +623,11 @@ router.get("/:id/connect", async (req, res) => {
     const driverName = user?.fullName?.trim() || "TravelMate Rider";
     const driverPhone = ride.userPhone || "";
 
+    // Seat availability — occupied seats = CONFIRMED (accepted) requests only.
+    const totalSeats = typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
+    const confirmedSeats = await confirmedCountForRide(ride._id);
+    const remainingSeats = Math.max(0, totalSeats - confirmedSeats);
+
     return res.status(200).json({
       success: true,
       data: {
@@ -590,7 +648,12 @@ router.get("/:id/connect", async (req, res) => {
           vehicleModel: ride.vehicleModel || "",
           vehicleColor: ride.vehicleColor || "",
           plateNumber: ride.plateNumber || "",
-          seatsAvailable: typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1,
+          seatsAvailable: totalSeats,
+          totalSeats,
+          confirmedSeats,
+          remainingSeats,
+          seatsLeft: remainingSeats,
+          isFull: remainingSeats <= 0,
           additionalInfo: sanitizeNotes(ride.additionalInfo),
           viewCount: (ride.viewCount || 0) + 1,
           createdAt: ride.createdAt,
@@ -669,12 +732,17 @@ router.get("/:id/details", async (req, res) => {
       : { userPhone: driverPhone };
 
     const todayISOStr = todayStr();
-    const [totalPostedRides, upcomingRides] = await Promise.all([
+    const [totalPostedRides, upcomingRides, confirmedSeats] = await Promise.all([
       driverPhone ? Ride.countDocuments(phoneClause) : Promise.resolve(0),
       driverPhone
         ? Ride.countDocuments({ ...phoneClause, date: { $gte: todayISOStr } })
         : Promise.resolve(0),
+      confirmedCountForRide(ride._id),
     ]);
+
+    // Seat availability — occupied seats = CONFIRMED (accepted) requests only.
+    const totalSeats = typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
+    const remainingSeats = Math.max(0, totalSeats - confirmedSeats);
 
     return res.status(200).json({
       success: true,
@@ -696,7 +764,12 @@ router.get("/:id/details", async (req, res) => {
           vehicleModel: ride.vehicleModel || "",
           vehicleColor: ride.vehicleColor || "",
           plateNumber: ride.plateNumber || "",
-          seatsAvailable: typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1,
+          seatsAvailable: totalSeats,
+          totalSeats,
+          confirmedSeats,
+          remainingSeats,
+          seatsLeft: remainingSeats,
+          isFull: remainingSeats <= 0,
           additionalInfo: sanitizeNotes(ride.additionalInfo),
           viewCount: ride.viewCount || 0,
           createdAt: ride.createdAt,
@@ -976,6 +1049,14 @@ router.post("/:id/request", async (req, res) => {
     if (reqDoc && (reqDoc.status === "pending" || reqDoc.status === "accepted")) {
       return res.status(409).json({ success: false, message: "You have already requested this ride", data: reqDoc });
     }
+
+    // Seat guard — a ride with no remaining seats (all confirmed) can't take
+    // new requests. Only CONFIRMED (accepted) requests occupy a seat.
+    const totalSeats = typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
+    const confirmedSeats = await confirmedCountForRide(ride._id);
+    if (confirmedSeats >= totalSeats) {
+      return res.status(409).json({ success: false, message: "This ride is full — no seats are available." });
+    }
     const snap = {
       posterPhone: ride.userPhone,
       riderPhone,
@@ -1075,12 +1156,35 @@ router.post("/requests/:reqId/accept", async (req, res) => {
     const ride = await Ride.findById(reqDoc.rideId);
     if (ride && isRideExpired(ride)) return res.status(400).json({ success: false, message: "Ride has expired or been closed" });
     if (reqDoc.status !== "pending") return res.status(400).json({ success: false, message: `Request already ${reqDoc.status}` });
-    reqDoc.status = "accepted";
-    await reqDoc.save();
-    notify(reqDoc.riderPhone, "Ride Request Accepted",
+
+    // Seat guard — never confirm more riders than the ride has seats. Only
+    // CONFIRMED (accepted) requests occupy a seat; pending/rejected/cancelled
+    // do not. This also settles the "multiple riders competing for the last
+    // seat" case: the owner accepts them one at a time, and once the seats
+    // are full every further accept is blocked here.
+    const totalSeats = ride && typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
+    const confirmedSeats = await confirmedCountForRide(reqDoc.rideId);
+    if (confirmedSeats >= totalSeats) {
+      return res.status(409).json({
+        success: false,
+        message: "All seats for this ride are already filled. You can no longer accept this request.",
+      });
+    }
+
+    // Atomic flip pending → accepted (guards against a double-click / race
+    // confirming the same request twice).
+    const updated = await RideRequest.findOneAndUpdate(
+      { _id: reqDoc._id, status: "pending" },
+      { $set: { status: "accepted" } },
+      { new: true }
+    );
+    if (!updated) {
+      return res.status(400).json({ success: false, message: "This request has already been handled." });
+    }
+    notify(updated.riderPhone, "Ride Request Accepted",
       `Your request has been accepted. You can now view the permitted contact details for this confirmed ride.`,
       "/requests");
-    return res.json({ success: true, message: "Request accepted", data: reqDoc });
+    return res.json({ success: true, message: "Request accepted", data: updated });
   } catch (err) {
     console.error("acceptRequest error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
