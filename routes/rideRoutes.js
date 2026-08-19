@@ -312,6 +312,9 @@ const enrichRidesWithUser = async (rides) => {
     obj.driverCity = user?.city || "";
     // Never expose a phone/email typed into notes in public ride lists.
     obj.additionalInfo = sanitizeNotes(obj.additionalInfo);
+    // Vehicle registration number is private — never expose it in public
+    // lists. It unlocks only to the paid rider (via /requests/outgoing).
+    obj.plateNumber = "";
     // Seat availability based on CONFIRMED requests only.
     attachSeatInfo(obj, counts.get(String(r._id)) || 0);
     out.push(obj);
@@ -677,7 +680,7 @@ router.get("/:id/connect", async (req, res) => {
           vehicle: ride.vehicle || "Bike",
           vehicleModel: ride.vehicleModel || "",
           vehicleColor: ride.vehicleColor || "",
-          plateNumber: ride.plateNumber || "",
+          plateNumber: "", // vehicle registration locked until booking is paid
           seatsAvailable: totalSeats,
           totalSeats,
           confirmedSeats,
@@ -793,7 +796,7 @@ router.get("/:id/details", async (req, res) => {
           vehicle: ride.vehicle || "Bike",
           vehicleModel: ride.vehicleModel || "",
           vehicleColor: ride.vehicleColor || "",
-          plateNumber: ride.plateNumber || "",
+          plateNumber: "", // vehicle registration locked until booking is paid
           seatsAvailable: totalSeats,
           totalSeats,
           confirmedSeats,
@@ -1159,16 +1162,24 @@ router.get("/requests/outgoing", async (req, res) => {
     for (const r of reqs) {
       const ride = rideMap[String(r.rideId)];
       let owner = null;
+      let vehicle = null;
       if (r.status === "accepted" && ride) {
         const u = await findUserByPhone(ride.userPhone);
-        // Driver profile (name/photo) is allowed at confirmation, but the
-        // CONTACT NUMBER unlocks ONLY after successful payment. This is the
-        // authoritative backend gate — never send the number before paid.
+        // Driver profile (name/photo) and basic vehicle info (model/color/type)
+        // are allowed at confirmation, but the CONTACT NUMBER and the VEHICLE
+        // REGISTRATION NUMBER unlock ONLY after successful payment. This is the
+        // authoritative backend gate — never send them before paid.
         const paid = r.paymentStatus === "paid";
         owner = {
           name: u?.fullName || "TravelMate Rider",
           photo: u?.photo || "",
           phone: paid ? ride.userPhone : "",
+        };
+        vehicle = {
+          model: ride.vehicleModel || "",
+          color: ride.vehicleColor || "",
+          type: ride.vehicle || "",
+          number: paid ? (ride.plateNumber || "") : "",
         };
       }
       data.push({
@@ -1180,6 +1191,7 @@ router.get("/requests/outgoing", async (req, res) => {
         amountPaid: r.amountPaid || 0,
         ride: ride ? { _id: ride._id, from: ride.from, to: ride.to, date: ride.date, time: ride.time, vehicle: ride.vehicle || "", status: rideStatusLabel(ride) } : null,
         owner,
+        vehicle,
         createdAt: r.createdAt,
       });
     }
