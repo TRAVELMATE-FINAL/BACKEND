@@ -1128,10 +1128,11 @@ router.get("/requests/incoming", async (req, res) => {
         _id: r._id, status: r.status, message: r.message,
         paymentStatus: r.paymentStatus || "none",
         amountPaid: r.amountPaid || 0,
-        // Rider contact only exposed to the owner once accepted.
+        // Rider contact exposed to the owner only after the booking is
+        // confirmed AND the rider has completed payment.
         rider: {
           name: r.riderName, photo: r.riderPhoto, city: r.riderCity,
-          phone: r.status === "accepted" ? r.riderPhone : "",
+          phone: (r.status === "accepted" && r.paymentStatus === "paid") ? r.riderPhone : "",
         },
         ride: ride ? { _id: ride._id, from: ride.from, to: ride.to, date: ride.date, time: ride.time, status: rideStatusLabel(ride) } : null,
         createdAt: r.createdAt,
@@ -1160,8 +1161,15 @@ router.get("/requests/outgoing", async (req, res) => {
       let owner = null;
       if (r.status === "accepted" && ride) {
         const u = await findUserByPhone(ride.userPhone);
-        // Contact revealed to the rider only after acceptance.
-        owner = { name: u?.fullName || "TravelMate Rider", phone: ride.userPhone, photo: u?.photo || "" };
+        // Driver profile (name/photo) is allowed at confirmation, but the
+        // CONTACT NUMBER unlocks ONLY after successful payment. This is the
+        // authoritative backend gate — never send the number before paid.
+        const paid = r.paymentStatus === "paid";
+        owner = {
+          name: u?.fullName || "TravelMate Rider",
+          photo: u?.photo || "",
+          phone: paid ? ride.userPhone : "",
+        };
       }
       data.push({
         _id: r._id, status: r.status,
@@ -1401,6 +1409,56 @@ router.post("/requests/:reqId/pay-verify", async (req, res) => {
   } catch (err) {
     console.error("bookingPayVerify error:", err);
     return res.status(500).json({ success: false, message: "Payment verification failed. Please try again." });
+  }
+});
+
+// POST /api/rides/requests/mark-paid
+//   { riderPhone, rideId, razorpay_order_id, razorpay_payment_id, razorpay_signature }
+// Called by the existing find-ride payment page after its payment verifies.
+// Marks the rider's CONFIRMED booking for this ride as PAID — which is what
+// unlocks the contact number. The Razorpay signature is re-verified here so a
+// booking can only be flipped to paid with a genuine payment proof.
+router.post("/requests/mark-paid", async (req, res) => {
+  try {
+    const { rideId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    const variants = phoneVariantsOf(req.body?.riderPhone);
+    if (!variants.length || !rideId) {
+      return res.status(400).json({ success: false, message: "Missing booking details" });
+    }
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ success: false, message: "Missing payment confirmation details" });
+    }
+    const expected = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest("hex");
+    if (expected !== razorpay_signature) {
+      return res.status(401).json({ success: false, message: "Payment could not be verified." });
+    }
+
+    const reqDoc = await RideRequest.findOne({
+      rideId,
+      riderPhone: { $in: variants },
+      status: "accepted",
+    });
+    if (!reqDoc) {
+      return res.status(404).json({ success: false, message: "No confirmed booking found for this ride." });
+    }
+    if (reqDoc.paymentStatus !== "paid") {
+      reqDoc.paymentStatus = "paid";
+      reqDoc.paymentId = razorpay_payment_id;
+      reqDoc.paymentOrderId = reqDoc.paymentOrderId || razorpay_order_id;
+      reqDoc.paidAt = new Date();
+      await reqDoc.save();
+      const ride = await Ride.findById(rideId).lean();
+      notify(reqDoc.riderPhone, "Payment Successful",
+        `Your payment is complete${ride ? ` for the ride from ${ride.from} to ${ride.to}` : ""}. The contact details are now available.`,
+        "/requests");
+    }
+    return res.json({ success: true, paymentStatus: "paid", bookingId: reqDoc._id });
+  } catch (err) {
+    console.error("markBookingPaid error:", err);
+    return res.status(500).json({ success: false, message: "Could not update payment status." });
   }
 });
 
