@@ -60,6 +60,31 @@ async function notify(userPhone, title, body, to) {
 // preferences (e.g. "AC car, No smoking, Pet friendly") are shown as-is; any
 // phone/email typed into the field is removed entirely (no visible marker) so
 // contact is never leaked here — it's shared only after payment.
+// Derive a pet-allowed boolean from free-text notes. True when pets are
+// mentioned WITHOUT a negation ("pet friendly", "pets allowed", "pets welcome"),
+// false for "no pets" / "pets not allowed" / no mention at all.
+function derivePetAllowed(text) {
+  const t = String(text || "").toLowerCase();
+  if (!/\bpets?\b/.test(t)) return false;
+  if (/\bno\s+pets?\b/.test(t)) return false;
+  if (/pets?\s+(are\s+)?not\s+allowed/.test(t)) return false;
+  if (/\bpets?\s+not\b/.test(t)) return false;
+  return true;
+}
+
+// Derive a smoking-allowed boolean from free-text notes. True only when
+// smoking is mentioned WITHOUT a negation ("smoking allowed", "smoker
+// friendly"). "no smoking", "non-smoking", "smoking not allowed", or no
+// mention at all → false (No Smoking).
+function deriveSmokingAllowed(text) {
+  const t = String(text || "").toLowerCase();
+  if (!/\bsmok/.test(t)) return false;
+  if (/\bno\s+smok/.test(t)) return false;
+  if (/non[-\s]?smok/.test(t)) return false;
+  if (/smoking\s+(is\s+)?not\s+allowed/.test(t)) return false;
+  return true;
+}
+
 function sanitizeNotes(text) {
   if (!text) return "";
   let out = String(text);
@@ -263,6 +288,8 @@ router.post("/", async (req, res) => {
       plateNumber:  plateNumber  || "",
       seatsAvailable: typeof seatsAvailable === "number" ? seatsAvailable : 1,
       additionalInfo: additionalInfo || "",
+      petAllowed: derivePetAllowed(additionalInfo),
+      smokingAllowed: deriveSmokingAllowed(additionalInfo),
     });
 
     return res.status(201).json({
@@ -347,6 +374,10 @@ const enrichRidesWithUser = async (rides) => {
     // Vehicle registration number is private — never expose it in public
     // lists. It unlocks only to the paid rider (via /requests/outgoing).
     obj.plateNumber = "";
+    // Pet-allowed boolean: use the stored value, or back-derive from notes for
+    // older rides that predate the field, so the filter matches consistently.
+    obj.petAllowed = obj.petAllowed === true || derivePetAllowed(obj.additionalInfo);
+    obj.smokingAllowed = obj.smokingAllowed === true || deriveSmokingAllowed(obj.additionalInfo);
     // Seat availability based on CONFIRMED requests only.
     attachSeatInfo(obj, counts.get(String(r._id)) || 0);
     out.push(obj);

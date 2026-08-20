@@ -56,6 +56,17 @@ const rideSchema = new mongoose.Schema(
     // Notes / preferences — completely OPTIONAL.
     additionalInfo: { type: String, default: "", maxlength: 500 },
 
+    // Whether pets are allowed on this ride. Derived from the notes at post
+    // time so the Find Ride "Pets Allowed" filter can match on a real boolean
+    // instead of fragile display text. Older rides without this field are
+    // back-derived from their notes when returned by the API.
+    petAllowed: { type: Boolean, default: false },
+
+    // Whether smoking is allowed. Derived from the notes at post time. A ride
+    // that doesn't mention smoking is treated as No Smoking (false). Older
+    // rides without this field are back-derived from their notes by the API.
+    smokingAllowed: { type: Boolean, default: false },
+
     // Lifecycle status. "active" by default; becomes "expired" automatically
     // once the ride's date+time passes, or "closed" if the owner closes it.
     // Expired/closed rides are excluded from search and can't take requests.
