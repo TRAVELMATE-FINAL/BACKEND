@@ -189,7 +189,7 @@ router.post("/", async (req, res) => {
       from, to, date, time, gender, distance, duration,
       fromLat, fromLon, toLat, toLon,
       userPhone, vehicle, vehicleModel, vehicleColor, plateNumber,
-      seatsAvailable, additionalInfo,
+      seatsAvailable, farePerSeat, additionalInfo,
     } = req.body;
 
     if (!from || !to || !date || !time || !gender || !distance || !duration) {
@@ -287,6 +287,7 @@ router.post("/", async (req, res) => {
       vehicleColor: vehicleColor || "",
       plateNumber:  plateNumber  || "",
       seatsAvailable: typeof seatsAvailable === "number" ? seatsAvailable : 1,
+      farePerSeat: typeof farePerSeat === "number" ? Math.max(0, farePerSeat) : 0,
       additionalInfo: additionalInfo || "",
       petAllowed: derivePetAllowed(additionalInfo),
       smokingAllowed: deriveSmokingAllowed(additionalInfo),
@@ -487,6 +488,7 @@ router.get("/by-user", async (req, res) => {
           vehicleColor: r.vehicleColor || "",
           plateNumber: r.plateNumber || "",
           seatsAvailable: typeof r.seatsAvailable === "number" ? r.seatsAvailable : 1,
+          farePerSeat: typeof r.farePerSeat === "number" ? r.farePerSeat : 0,
           totalSeats: typeof r.seatsAvailable === "number" ? r.seatsAvailable : 1,
           confirmedSeats: seatCounts.get(String(r._id)) || 0,
           remainingSeats: Math.max(
@@ -745,6 +747,7 @@ router.get("/:id/connect", async (req, res) => {
           vehicleColor: ride.vehicleColor || "",
           plateNumber: "", // vehicle registration locked until booking is paid
           seatsAvailable: totalSeats,
+          farePerSeat: ride.farePerSeat || 0,
           totalSeats,
           confirmedSeats,
           remainingSeats,
@@ -861,6 +864,7 @@ router.get("/:id/details", async (req, res) => {
           vehicleColor: ride.vehicleColor || "",
           plateNumber: "", // vehicle registration locked until booking is paid
           seatsAvailable: totalSeats,
+          farePerSeat: ride.farePerSeat || 0,
           totalSeats,
           confirmedSeats,
           remainingSeats,
@@ -1037,7 +1041,7 @@ router.patch("/:id", async (req, res) => {
 
     // Whitelist editable fields so the user can't reassign owner / coords etc.
     const editable = [
-      "date", "time", "seatsAvailable", "gender",
+      "date", "time", "seatsAvailable", "farePerSeat", "gender",
       "vehicle", "vehicleModel", "vehicleColor", "plateNumber",
       "additionalInfo",
     ];
@@ -1051,6 +1055,9 @@ router.patch("/:id", async (req, res) => {
             });
           }
           ride[k] = n;
+        } else if (k === "farePerSeat") {
+          const n = Number(req.body[k]);
+          ride[k] = Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
         } else if (k === "plateNumber") {
           ride[k] = String(req.body[k] || "").toUpperCase().replace(/[\s-]/g, "");
         } else {

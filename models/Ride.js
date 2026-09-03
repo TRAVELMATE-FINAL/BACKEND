@@ -52,6 +52,7 @@ const rideSchema = new mongoose.Schema(
     vehicleColor: { type: String, default: "",     trim: true },     // e.g. "White"
     plateNumber:  { type: String, default: "",     trim: true },     // e.g. "TN09 AB1234"
     seatsAvailable: { type: Number, default: 1, min: 0 },            // pillion/seats free
+    farePerSeat:    { type: Number, default: 0, min: 0 },            // ₹ each co-passenger pays per seat
 
     // Notes / preferences — completely OPTIONAL.
     additionalInfo: { type: String, default: "", maxlength: 500 },
