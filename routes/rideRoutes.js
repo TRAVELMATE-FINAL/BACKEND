@@ -366,7 +366,7 @@ const enrichRidesWithUser = async (rides) => {
   for (const r of rides) {
     const user = await findUserByPhone(r.userPhone);
     const obj = r.toObject ? r.toObject() : r;
-    obj.driverName = user?.fullName?.trim() || "TravelMate Rider";
+    obj.driverName = user?.fullName?.trim() || "Vooggly Rider";
     obj.driverPhoto = user?.photo || "";
     obj.driverCity = user?.city || "";
     // Never expose a phone/email typed into notes in public ride lists.
@@ -716,7 +716,7 @@ router.get("/:id/connect", async (req, res) => {
       `[connect] rideId=${id} userPhone="${ride.userPhone}" → user=${user?.fullName || "(not found)"}`
     );
 
-    const driverName = user?.fullName?.trim() || "TravelMate Rider";
+    const driverName = user?.fullName?.trim() || "Vooggly Rider";
     const driverPhone = ride.userPhone || "";
 
     // Seat availability — occupied seats = CONFIRMED (accepted) requests only.
@@ -872,7 +872,7 @@ router.get("/:id/details", async (req, res) => {
           status: rideStatusLabel(ride),
         },
         driver: {
-          fullName: user?.fullName?.trim() || "TravelMate Rider",
+          fullName: user?.fullName?.trim() || "Vooggly Rider",
           photo: user?.photo || "",
           city: user?.city || "",
           email: user?.email || "",
@@ -1250,7 +1250,7 @@ router.get("/requests/outgoing", async (req, res) => {
         // authoritative backend gate — never send them before paid.
         const paid = r.paymentStatus === "paid";
         owner = {
-          name: u?.fullName || "TravelMate Rider",
+          name: u?.fullName || "Vooggly Rider",
           photo: u?.photo || "",
           phone: paid ? ride.userPhone : "",
         };

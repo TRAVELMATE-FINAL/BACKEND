@@ -13,6 +13,15 @@ const userSchema = new mongoose.Schema(
       default: false,
     },
 
+    // Password login. Stored as "salt:hash" (scrypt). select:false so it's
+    // never returned by default queries — only fetched explicitly for login.
+    // Empty for legacy users until they set one after their next OTP login.
+    passwordHash: {
+      type: String,
+      default: "",
+      select: false,
+    },
+
     // Profile fields
     fullName: {
       type: String,

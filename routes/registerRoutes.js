@@ -2,9 +2,26 @@
 const express = require("express");
 const router = express.Router();
 const twilio = require("twilio");
+const crypto = require("crypto");
 
 const User = require("../models/User");
 const { setOtp, verifyOtp: checkOtp } = require("../utils/otpStore");
+
+// ── Password hashing (Node's built-in scrypt — no extra dependency) ──
+function hashPassword(pw) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(String(pw), salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+function verifyPassword(pw, stored) {
+  if (!stored || !stored.includes(":")) return false;
+  const [salt, hash] = stored.split(":");
+  const test = crypto.scryptSync(String(pw), salt, 64).toString("hex");
+  const a = Buffer.from(hash, "hex");
+  const b = Buffer.from(test, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+const isValidPassword = (pw) => typeof pw === "string" && pw.length >= 6;
 
 const client = twilio(
   process.env.TWILIO_SID,
@@ -35,7 +52,7 @@ router.post("/send-otp", async (req, res) => {
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-    const messageText = `Dear User, your TravelMate OTP is ${otp}. It is valid for 1 minute. Do not share it.`;
+    const messageText = `Dear User, your Vooggly OTP is ${otp}. It is valid for 1 minute. Do not share it.`;
 
     console.log("MESSAGE BODY:", messageText);
 
@@ -70,10 +87,16 @@ router.post("/send-otp", async (req, res) => {
 // ======================
 router.post("/verify-otp", async (req, res) => {
   try {
-    const { phone, otp } = req.body;
+    const { phone, otp, password } = req.body;
 
     if (!phone || !otp) {
       return res.status(400).json({ message: "Phone and OTP required" });
+    }
+    // OTP is the gate for setting a password (registration, recovery, or an
+    // existing user setting one for the first time). If a password is sent it
+    // must be valid.
+    if (password !== undefined && !isValidPassword(password)) {
+      return res.status(400).json({ message: "Password must be at least 6 characters" });
     }
 
     const cleanPhone = phone.replace("+91", "");
@@ -108,15 +131,73 @@ router.post("/verify-otp", async (req, res) => {
       await user.save();
     }
 
+    // If a password was provided (registration / forgot-password / first-time
+    // set after OTP login), store it now — OTP just proved ownership.
+    if (password !== undefined) {
+      user.passwordHash = hashPassword(password);
+      await user.save();
+    }
+
+    const safe = user.toObject ? user.toObject() : user;
+    if (safe && safe.passwordHash) delete safe.passwordHash;
+
     return res.json({
       message: "Verified successfully",
-      user,
+      user: safe,
+      hasPassword: !!user.passwordHash,
     });
   } catch (err) {
     console.error("❌ VERIFY OTP ERROR:", err);
     return res.status(500).json({
       message: err.message || "Verification failed",
     });
+  }
+});
+
+// ======================
+// PASSWORD LOGIN (no OTP)
+// POST /login  { phone, password }
+// ======================
+router.post("/login", async (req, res) => {
+  try {
+    const { phone, password } = req.body || {};
+    if (!phone) return res.status(400).json({ message: "Phone number is required" });
+
+    const cleanPhone = String(phone).replace("+91", "");
+    if (!/^\d{10}$/.test(cleanPhone)) {
+      return res.status(400).json({ message: "Phone number must be exactly 10 digits" });
+    }
+    const fullPhone = `+91${cleanPhone}`;
+
+    // passwordHash is select:false — request it explicitly for the check.
+    const user = await User.findOne({ phone: fullPhone }).select("+passwordHash");
+    if (!user) {
+      return res.status(404).json({ message: "No account found for this number. Please register.", code: "NO_ACCOUNT" });
+    }
+    if (user.isBlocked) {
+      return res.status(403).json({
+        message: user.blockReason
+          ? `Your account has been blocked: ${user.blockReason}`
+          : "Your account has been blocked. Please contact support.",
+        blocked: true,
+      });
+    }
+    // Legacy user with no password yet → tell the client to verify via OTP and
+    // set one (the "set password on next OTP login" path).
+    if (!user.passwordHash) {
+      return res.status(200).json({ needsPassword: true, message: "Please verify via OTP to set your password." });
+    }
+    if (!password) return res.status(400).json({ message: "Password is required" });
+    if (!verifyPassword(password, user.passwordHash)) {
+      return res.status(401).json({ message: "Incorrect phone number or password." });
+    }
+
+    const safe = user.toObject();
+    delete safe.passwordHash;
+    return res.json({ message: "Login successful", user: safe });
+  } catch (err) {
+    console.error("❌ LOGIN ERROR:", err);
+    return res.status(500).json({ message: err.message || "Login failed" });
   }
 });
 
