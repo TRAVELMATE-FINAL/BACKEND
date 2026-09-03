@@ -4,6 +4,31 @@ const Razorpay = require("razorpay");
 const Subscription = require("../models/Subscription");
 const Coupon = require("../models/Coupon");
 const Setting = require("../models/Setting");
+const User = require("../models/User");
+
+// Server-side auth gate for paid actions. A phone alone is not proof of login —
+// require that it maps to a real, verified, non-blocked account. Returns the
+// user on success; on failure sends the response and returns null.
+async function requireLoggedInUser(phone, res) {
+  const user = await User.findOne({ phone });
+  if (!user || !user.isVerified) {
+    res.status(401).json({
+      message: "Please log in or create an account to make a payment.",
+      code: "AUTH_REQUIRED",
+    });
+    return null;
+  }
+  if (user.isBlocked) {
+    res.status(403).json({
+      message: user.blockReason
+        ? `Your account has been blocked: ${user.blockReason}`
+        : "Your account has been blocked. Please contact support.",
+      blocked: true,
+    });
+    return null;
+  }
+  return user;
+}
 
 // ── Static plan metadata (labels only — prices/durations come from the DB) ──
 const PLAN_META = {
@@ -194,6 +219,8 @@ exports.createOrder = async (req, res) => {
     const purpose = ["find", "booking"].includes(req.body.purpose) ? req.body.purpose : "post";
     const phone = normPhone(req.body.phone);
     if (!phone) return res.status(400).json({ message: "Valid phone is required" });
+    // Auth gate: only a real, verified account may start a payment.
+    if (!(await requireLoggedInUser(phone, res))) return;
     const catalog = await loadCatalog();
     if (!catalog[plan]) return res.status(400).json({ message: "Invalid plan" });
     // Find Ride has ONLY the Daily plan.
@@ -283,6 +310,8 @@ exports.verifyPayment = async (req, res) => {
     if (!phone || !catalog[plan]) {
       return res.status(400).json({ message: "Phone and valid plan are required" });
     }
+    // Auth gate: verification/activation only for a real, verified account.
+    if (!(await requireLoggedInUser(phone, res))) return;
     if (purpose === "find" && plan !== "daily") {
       return res.status(400).json({ message: "Find Ride supports only the Daily plan" });
     }

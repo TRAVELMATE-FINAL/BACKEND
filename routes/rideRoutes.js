@@ -180,6 +180,31 @@ const findUserByPhone = async (phone) => {
   return null;
 };
 
+// Auth gate for paid booking actions: the rider must be a real, verified,
+// non-blocked account. On failure it sends the response and returns null.
+const requireVerifiedRider = async (phone, res) => {
+  const u = await findUserByPhone(phone);
+  if (!u || !u.isVerified) {
+    res.status(401).json({
+      success: false,
+      code: "AUTH_REQUIRED",
+      message: "Please log in or create an account to make a payment.",
+    });
+    return null;
+  }
+  if (u.isBlocked) {
+    res.status(403).json({
+      success: false,
+      blocked: true,
+      message: u.blockReason
+        ? `Your account has been blocked: ${u.blockReason}`
+        : "Your account has been blocked. Please contact support.",
+    });
+    return null;
+  }
+  return u;
+};
+
 // ============================================================
 // POST /api/rides — create a new ride
 // ============================================================
@@ -1394,6 +1419,8 @@ router.post("/requests/:reqId/pay-order", async (req, res) => {
     if (!samePhone(reqDoc.riderPhone, req.body?.riderPhone)) {
       return res.status(403).json({ success: false, message: "Not authorized" });
     }
+    // Auth gate: only a real, verified account may start a payment.
+    if (!(await requireVerifiedRider(req.body?.riderPhone, res))) return;
     if (reqDoc.status !== "accepted") {
       return res.status(400).json({ success: false, message: "Payment becomes available once the driver confirms your booking." });
     }
@@ -1462,6 +1489,8 @@ router.post("/requests/:reqId/pay-verify", async (req, res) => {
     if (!samePhone(reqDoc.riderPhone, req.body?.riderPhone)) {
       return res.status(403).json({ success: false, message: "Not authorized" });
     }
+    // Auth gate: only a real, verified account may finalize a payment.
+    if (!(await requireVerifiedRider(req.body?.riderPhone, res))) return;
     // Already verified — return success so a double-submit is harmless.
     if (reqDoc.paymentStatus === "paid") {
       return res.json({ success: true, alreadyPaid: true, paymentStatus: "paid" });
@@ -1523,6 +1552,8 @@ router.post("/requests/mark-paid", async (req, res) => {
     if (!variants.length || !rideId) {
       return res.status(400).json({ success: false, message: "Missing booking details" });
     }
+    // Auth gate: only a real, verified account may finalize a payment.
+    if (!(await requireVerifiedRider(req.body?.riderPhone, res))) return;
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ success: false, message: "Missing payment confirmation details" });
     }
