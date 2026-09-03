@@ -202,6 +202,33 @@ router.post("/login", async (req, res) => {
 });
 
 // ======================
+// ACCOUNT STATUS (no OTP, no SMS)
+// GET /account-status?phone=XXXXXXXXXX
+// Lets the client know, before the "Create a new account" OTP is sent,
+// whether the number already belongs to an account — so an existing user
+// is told to sign in instead of silently resetting their password.
+// ======================
+router.get("/account-status", async (req, res) => {
+  try {
+    const raw = String(req.query.phone || "");
+    const cleanPhone = raw.replace("+91", "").replace(/\D/g, "");
+    if (!/^\d{10}$/.test(cleanPhone)) {
+      return res.status(400).json({ message: "Phone number must be exactly 10 digits" });
+    }
+    const fullPhone = `+91${cleanPhone}`;
+    const user = await User.findOne({ phone: fullPhone }).select("+passwordHash");
+    return res.json({
+      exists: !!user,
+      hasPassword: !!(user && user.passwordHash),
+      blocked: !!(user && user.isBlocked),
+    });
+  } catch (err) {
+    console.error("❌ ACCOUNT STATUS ERROR:", err);
+    return res.status(500).json({ message: err.message || "Could not check account" });
+  }
+});
+
+// ======================
 // SAVE PROFILE
 // POST /profile
 // ======================
