@@ -18,19 +18,24 @@ const rideRequestSchema = new mongoose.Schema(
     // Optional note from the rider.
     message: { type: String, default: "", maxlength: 300 },
 
+    // Lifecycle. PAY-FIRST flow:
+    //   awaiting_payment → (rider pays) → pending → accepted / rejected / expired
+    // "awaiting_payment" is an internal holding state that owns the Razorpay
+    // order; it is NEVER shown to the ride owner and never notified. The request
+    // is only "sent" (visible to the owner) once payment succeeds → "pending".
     status: {
       type: String,
-      enum: ["pending", "accepted", "rejected", "cancelled", "expired"],
-      default: "pending",
+      enum: ["awaiting_payment", "pending", "accepted", "rejected", "cancelled", "expired"],
+      default: "awaiting_payment",
       index: true,
     },
 
-    // ── Payment (booking fee, charged AFTER the driver confirms) ────────
-    // Kept independent of `status` so a CONFIRMED booking can still be
-    // PENDING payment. Only meaningful once status === "accepted".
+    // ── Payment (booking fee, charged BEFORE the request is sent) ────────
+    // In the pay-first flow the rider pays up front; the request is created &
+    // sent to the owner only after paymentStatus === "paid".
     paymentStatus: {
       type: String,
-      enum: ["none", "pending", "paid", "failed"],
+      enum: ["none", "pending", "paid", "failed", "refund_pending", "refunded", "refund_failed"],
       default: "none",
       index: true,
     },
@@ -39,11 +44,21 @@ const rideRequestSchema = new mongoose.Schema(
     amountDue:      { type: Number, default: 0 },   // rupees the rider must pay
     amountPaid:     { type: Number, default: 0 },   // rupees actually charged
     paidAt:         { type: Date,   default: null },
+
+    // Owner must respond before this instant, else the request auto-expires and
+    // the payment is refunded. Set when payment completes (status → pending).
+    requestExpiresAt: { type: Date, default: null, index: true },
+
+    // ── Refund (auto-refund to Razorpay on reject / expiry) ─────────────
+    refundId:     { type: String, default: "" },   // Razorpay refund id
+    refundAmount: { type: Number, default: 0 },     // rupees refunded
+    refundedAt:   { type: Date,   default: null },
+    refundReason: { type: String, default: "" },    // "rejected" | "expired" | ...
   },
   { timestamps: true }
 );
 
-// One active request per rider per ride (prevents duplicate requests).
+// One request per rider per ride (prevents duplicate requests & payments).
 rideRequestSchema.index({ rideId: 1, riderPhone: 1 }, { unique: true });
 
 module.exports = mongoose.model("RideRequest", rideRequestSchema);

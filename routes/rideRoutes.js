@@ -55,6 +55,96 @@ async function notify(userPhone, title, body, to) {
   } catch (e) { /* non-fatal */ }
 }
 
+// ── SMS (Twilio) — fire-and-forget owner alert ──────────────────────────
+// Reuses the same Twilio creds as the OTP flow. Never throws; SMS failure must
+// not break the request flow (the in-app notification still fires).
+let _twilioClient = null;
+function getTwilio() {
+  if (_twilioClient) return _twilioClient;
+  try {
+    if (!process.env.TWILIO_SID || !process.env.TWILIO_AUTH_TOKEN) return null;
+    _twilioClient = require("twilio")(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
+    return _twilioClient;
+  } catch { return null; }
+}
+async function sendSms(toPhone, body) {
+  try {
+    const client = getTwilio();
+    const from = String(process.env.TWILIO_PHONE || "").replace(/[^\d+]/g, "");
+    if (!client || !from || !toPhone) return;
+    const to = normalizePhone(toPhone);
+    await client.messages.create({ body, from, to });
+  } catch (e) { /* non-fatal */ }
+}
+
+// ── Auto-refund a paid request to the original Razorpay payment ──────────
+// Idempotent: only refunds a request whose paymentStatus is exactly "paid".
+// On success → "refunded"; on API failure → "refund_pending" so it can be
+// retried / handled manually from the admin panel. Never throws.
+const REQUEST_TTL_MS = 60 * 60 * 1000; // owner has 1 hour to respond
+
+async function refundRequestPayment(reqDoc, reason) {
+  try {
+    if (!reqDoc) return;
+    if (reqDoc.paymentStatus !== "paid") return;          // nothing to refund / already handled
+    if (!reqDoc.paymentId || !(reqDoc.amountPaid > 0)) {
+      reqDoc.paymentStatus = "refund_pending";
+      reqDoc.refundReason = reason || "";
+      await reqDoc.save();
+      return;
+    }
+    const client = planCtrl.getRazorpayClient();
+    if (!client) {
+      reqDoc.paymentStatus = "refund_pending";
+      reqDoc.refundReason = reason || "";
+      await reqDoc.save();
+      return;
+    }
+    const refund = await client.payments.refund(reqDoc.paymentId, {
+      amount: Math.round(reqDoc.amountPaid * 100), // paise
+      speed: "normal",
+      notes: { reason: reason || "", bookingId: String(reqDoc._id) },
+    });
+    reqDoc.paymentStatus = "refunded";
+    reqDoc.refundId = refund?.id || "";
+    reqDoc.refundAmount = reqDoc.amountPaid;
+    reqDoc.refundedAt = new Date();
+    reqDoc.refundReason = reason || "";
+    await reqDoc.save();
+  } catch (e) {
+    try {
+      reqDoc.paymentStatus = "refund_pending";
+      reqDoc.refundReason = reason || "";
+      await reqDoc.save();
+    } catch (_e) {}
+    console.error("refundRequestPayment error:", e?.message || e);
+  }
+}
+
+// ── Sweep: auto-expire PAID+PENDING requests the owner didn't answer in time.
+// Lazy sweep (no cron dependency) — invoked from request list/detail endpoints.
+let _lastReqSweep = 0;
+async function sweepExpiredRequests() {
+  const now = Date.now();
+  if (now - _lastReqSweep < 30000) return; // at most every 30s
+  _lastReqSweep = now;
+  try {
+    const due = await RideRequest.find({
+      status: "pending",
+      requestExpiresAt: { $ne: null, $lt: new Date() },
+    });
+    for (const reqDoc of due) {
+      reqDoc.status = "expired";
+      await reqDoc.save();
+      await refundRequestPayment(reqDoc, "expired");
+      const ride = await Ride.findById(reqDoc.rideId).select("from to");
+      notify(reqDoc.riderPhone, "Ride Request Expired",
+        `The ride owner didn't respond in time${ride ? ` to your request from ${ride.from} to ${ride.to}` : ""}. Your payment has been refunded.`,
+        "/requests?tab=sent");
+    }
+  } catch (e) { /* non-fatal */ }
+}
+
 // Strip ONLY contact info (phone numbers, emails) from the notes while keeping
 // the rest of the poster's preferences intact and readable. The real
 // preferences (e.g. "AC car, No smoking, Pet friendly") are shown as-is; any
@@ -114,9 +204,12 @@ async function sweepExpiredRides() {
       await Ride.updateOne({ _id: r._id }, { $set: { status: "expired" } });
       const pend = await RideRequest.find({ rideId: r._id, status: "pending" });
       for (const req of pend) {
-        await RideRequest.updateOne({ _id: req._id }, { $set: { status: "expired" } });
+        req.status = "expired";
+        await req.save();
+        // Pay-first: a pending request is already paid → refund it.
+        await refundRequestPayment(req, "ride_expired");
         notify(req.riderPhone, "Ride Expired",
-          `The ride from ${r.from} to ${r.to} has reached its scheduled time and is no longer available. Your request has been closed.`, "");
+          `The ride from ${r.from} to ${r.to} has reached its scheduled time and is no longer available. Your request has been closed and your payment refunded.`, "/requests?tab=sent");
       }
     }
   } catch (e) { /* non-fatal */ }
@@ -1170,12 +1263,29 @@ const phoneVariantsOf = (raw) => {
 const samePhone = (a, b) =>
   phoneVariantsOf(a).some((v) => phoneVariantsOf(b).includes(v));
 
-// POST /api/rides/:id/request  { riderPhone, message? }
+// DEPRECATED — the old FREE request endpoint. The flow is now PAY-FIRST, so a
+// request can no longer be created for free. A stale client hitting this is
+// told to use the new flow (prevents bypassing payment).
 router.post("/:id/request", async (req, res) => {
+  return res.status(426).json({
+    success: false,
+    code: "PAYMENT_REQUIRED_FIRST",
+    message: "Payment is required before sending a ride request. Please refresh the page and try again.",
+  });
+});
+
+// POST /api/rides/:id/request-order  { riderPhone, message? }
+// PAY-FIRST step 1: validate eligibility and create (or reuse) a Razorpay order
+// for the booking fee. Creates a hidden "awaiting_payment" request that holds
+// the order. The owner is NOT notified yet — the request is only sent after the
+// payment is verified in step 2.
+router.post("/:id/request-order", async (req, res) => {
   try {
     const riderPhone = normalizePhone(req.body?.riderPhone || "");
     const message = String(req.body?.message || "").slice(0, 300);
     if (!riderPhone) return res.status(400).json({ success: false, message: "Rider phone is required" });
+    // Auth gate: only a real, verified account may request/pay.
+    if (!(await requireVerifiedRider(riderPhone, res))) return;
 
     const ride = await Ride.findById(req.params.id);
     if (!ride) return res.status(404).json({ success: false, message: "Ride not found" });
@@ -1184,23 +1294,31 @@ router.post("/:id/request", async (req, res) => {
       return res.status(400).json({ success: false, message: "You can't request your own ride" });
     }
 
-    // Requesting a ride is FREE. Payment (the Find Ride Daily plan) happens
-    // only AFTER the driver accepts, via the "Pay Now" step — which then
-    // unlocks the contact and vehicle number for this confirmed booking.
-
-    const rider = await findUserByPhone(riderPhone);
+    // Duplicate guard — one live request per rider per ride.
     let reqDoc = await RideRequest.findOne({ rideId: ride._id, riderPhone });
     if (reqDoc && (reqDoc.status === "pending" || reqDoc.status === "accepted")) {
-      return res.status(409).json({ success: false, message: "You have already requested this ride", data: reqDoc });
+      return res.status(409).json({ success: false, message: "You have already requested this ride.", data: { _id: reqDoc._id, status: reqDoc.status } });
     }
 
-    // Seat guard — a ride with no remaining seats (all confirmed) can't take
-    // new requests. Only CONFIRMED (accepted) requests occupy a seat.
+    // Seat guard — no seats free (all confirmed) → can't request.
     const totalSeats = typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
     const confirmedSeats = await confirmedCountForRide(ride._id);
     if (confirmedSeats >= totalSeats) {
       return res.status(409).json({ success: false, message: "This ride is full — no seats are available." });
     }
+
+    // Fee (admin-configured Find Ride daily price), in rupees.
+    const feeRupees = await planCtrl.loadBookingFee();
+    const amountPaise = Math.round(Number(feeRupees) * 100);
+    if (!(amountPaise > 0)) {
+      return res.status(500).json({ success: false, message: "Booking fee is not configured. Please try again later." });
+    }
+
+    const client = planCtrl.getRazorpayClient();
+    if (!client) return res.status(500).json({ success: false, message: "Payment is temporarily unavailable. Please try again later." });
+    const KEY = process.env.RAZORPAY_KEY_ID;
+
+    const rider = await findUserByPhone(riderPhone);
     const snap = {
       posterPhone: ride.userPhone,
       riderPhone,
@@ -1208,21 +1326,121 @@ router.post("/:id/request", async (req, res) => {
       riderPhoto: rider?.photo || "",
       riderCity: rider?.city || "",
       message,
-      status: "pending",
+      status: "awaiting_payment",
+      paymentStatus: "pending",
+      amountDue: Number(feeRupees),
     };
-    if (reqDoc) { Object.assign(reqDoc, snap); await reqDoc.save(); }
-    else { reqDoc = await RideRequest.create({ rideId: ride._id, ...snap }); }
+    if (reqDoc) { Object.assign(reqDoc, snap); }
+    else { reqDoc = new RideRequest({ rideId: ride._id, ...snap }); }
 
-    notify(ride.userPhone, "New Ride Request",
-      `A user has requested to join your ride from ${ride.from} to ${ride.to}. Please review the request and choose Accept or Reject.`, "/requests");
+    // Reuse an existing unpaid order so refresh/retry can't spawn duplicates.
+    let order = null;
+    if (reqDoc.paymentOrderId) {
+      try {
+        const existing = await client.orders.fetch(reqDoc.paymentOrderId);
+        if (existing && existing.status !== "paid") order = existing;
+      } catch (_e) { /* create a fresh one below */ }
+    }
+    if (!order) {
+      order = await client.orders.create({
+        amount: amountPaise,
+        currency: "INR",
+        receipt: `req_${reqDoc._id}`,
+        notes: { rideId: String(ride._id), riderPhone, purpose: "ride_request" },
+      });
+      reqDoc.paymentOrderId = order.id;
+    }
+    await reqDoc.save();
 
-    return res.status(201).json({ success: true, message: "Request sent", data: reqDoc });
+    return res.status(201).json({
+      success: true,
+      bookingId: reqDoc._id,
+      orderId: order.id,
+      amount: order.amount,        // paise
+      amountRupees: Number(feeRupees),
+      currency: order.currency || "INR",
+      key: KEY,
+    });
   } catch (err) {
     if (err && err.code === 11000) {
-      return res.status(409).json({ success: false, message: "You have already requested this ride" });
+      return res.status(409).json({ success: false, message: "You have already requested this ride." });
     }
-    console.error("createRideRequest error:", err);
-    return res.status(500).json({ success: false, message: "Server error while sending request" });
+    console.error("requestOrder error:", err);
+    return res.status(500).json({ success: false, message: "Server error while starting payment" });
+  }
+});
+
+// POST /api/rides/requests/:reqId/request-pay-verify
+//   { riderPhone, razorpay_order_id, razorpay_payment_id, razorpay_signature }
+// PAY-FIRST step 2: verify the payment signature, then SEND the request to the
+// owner (status awaiting_payment → pending) and notify them. Idempotent.
+router.post("/requests/:reqId/request-pay-verify", async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    const reqDoc = await RideRequest.findById(req.params.reqId);
+    if (!reqDoc) return res.status(404).json({ success: false, message: "Request not found" });
+    if (!samePhone(reqDoc.riderPhone, req.body?.riderPhone)) {
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    }
+    if (!(await requireVerifiedRider(req.body?.riderPhone, res))) return;
+
+    // Idempotent — already paid & sent.
+    if (reqDoc.paymentStatus === "paid" && reqDoc.status === "pending") {
+      return res.json({ success: true, alreadySent: true, data: reqDoc });
+    }
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ success: false, message: "Missing payment confirmation details" });
+    }
+    const expected = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest("hex");
+    if (expected !== razorpay_signature) {
+      return res.status(401).json({ success: false, message: "Payment could not be verified." });
+    }
+
+    const ride = await Ride.findById(reqDoc.rideId);
+    if (!ride || isRideExpired(ride)) {
+      // Ride gone/expired between order and payment → refund, don't send.
+      reqDoc.paymentStatus = "paid"; reqDoc.paymentId = razorpay_payment_id;
+      reqDoc.amountPaid = reqDoc.amountDue; reqDoc.paidAt = new Date();
+      reqDoc.status = "cancelled";
+      await reqDoc.save();
+      await refundRequestPayment(reqDoc, "ride_unavailable");
+      return res.status(409).json({ success: false, refunded: true, message: "This ride is no longer available. Your payment has been refunded." });
+    }
+    // Seats may have filled while paying → refund, don't send.
+    const totalSeats = typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
+    const confirmedSeats = await confirmedCountForRide(ride._id);
+    if (confirmedSeats >= totalSeats) {
+      reqDoc.paymentStatus = "paid"; reqDoc.paymentId = razorpay_payment_id;
+      reqDoc.amountPaid = reqDoc.amountDue; reqDoc.paidAt = new Date();
+      reqDoc.status = "cancelled";
+      await reqDoc.save();
+      await refundRequestPayment(reqDoc, "ride_full");
+      return res.status(409).json({ success: false, refunded: true, message: "This ride just became full. Your payment has been refunded." });
+    }
+
+    // Success → mark paid and SEND the request to the owner.
+    reqDoc.paymentStatus = "paid";
+    reqDoc.paymentId = razorpay_payment_id;
+    reqDoc.amountPaid = reqDoc.amountDue;
+    reqDoc.paidAt = new Date();
+    reqDoc.status = "pending"; // "Paid – Pending Ride Owner Response"
+    reqDoc.requestExpiresAt = new Date(Date.now() + REQUEST_TTL_MS);
+    await reqDoc.save();
+
+    // Notify owner: in-app + badge (Notification doc) + SMS.
+    notify(ride.userPhone, "New Ride Request",
+      `${reqDoc.riderName || "A rider"} has paid and requested to join your ride from ${ride.from} to ${ride.to}. Please Accept or Reject within 1 hour.`,
+      "/requests");
+    sendSms(ride.userPhone,
+      `Vooggly: New ride request from ${reqDoc.riderName || "a rider"} for ${ride.from} → ${ride.to}. Accept/Reject within 1 hour in the app.`);
+
+    return res.json({ success: true, message: "Payment successful. Your request has been sent to the ride owner.", data: reqDoc });
+  } catch (err) {
+    console.error("requestPayVerify error:", err);
+    return res.status(500).json({ success: false, message: "Server error while confirming payment" });
   }
 });
 
@@ -1230,9 +1448,14 @@ router.post("/:id/request", async (req, res) => {
 router.get("/requests/incoming", async (req, res) => {
   try {
     await sweepExpiredRides();
+    await sweepExpiredRequests();
     const variants = phoneVariantsOf(req.query.phone);
     if (!variants.length) return res.status(400).json({ success: false, message: "phone is required" });
-    const reqs = await RideRequest.find({ posterPhone: { $in: variants } }).sort({ createdAt: -1 }).lean();
+    // Never show the owner an unpaid hold — only requests that were actually sent.
+    const reqs = await RideRequest.find({
+      posterPhone: { $in: variants },
+      status: { $ne: "awaiting_payment" },
+    }).sort({ createdAt: -1 }).lean();
     const rideIds = [...new Set(reqs.map((r) => String(r.rideId)))];
     const rides = await Ride.find({ _id: { $in: rideIds } }).lean();
     const rideMap = {}; rides.forEach((r) => { rideMap[String(r._id)] = r; });
@@ -1263,9 +1486,14 @@ router.get("/requests/incoming", async (req, res) => {
 router.get("/requests/outgoing", async (req, res) => {
   try {
     await sweepExpiredRides();
+    await sweepExpiredRequests();
     const variants = phoneVariantsOf(req.query.phone);
     if (!variants.length) return res.status(400).json({ success: false, message: "phone is required" });
-    const reqs = await RideRequest.find({ riderPhone: { $in: variants } }).sort({ createdAt: -1 }).lean();
+    // Hide unpaid holds — the rider only sees requests they actually paid & sent.
+    const reqs = await RideRequest.find({
+      riderPhone: { $in: variants },
+      status: { $ne: "awaiting_payment" },
+    }).sort({ createdAt: -1 }).lean();
     const rideIds = [...new Set(reqs.map((r) => String(r.rideId)))];
     const rides = await Ride.find({ _id: { $in: rideIds } }).lean();
     const rideMap = {}; rides.forEach((r) => { rideMap[String(r._id)] = r; });
@@ -1300,6 +1528,9 @@ router.get("/requests/outgoing", async (req, res) => {
         paymentStatus: r.paymentStatus || "none",
         amountDue: r.amountDue || 0,
         amountPaid: r.amountPaid || 0,
+        refundAmount: r.refundAmount || 0,
+        refundReason: r.refundReason || "",
+        requestExpiresAt: r.requestExpiresAt || null,
         ride: ride ? { _id: ride._id, from: ride.from, to: ride.to, date: ride.date, time: ride.time, vehicle: ride.vehicle || "", status: rideStatusLabel(ride) } : null,
         owner,
         vehicle,
@@ -1343,7 +1574,7 @@ router.post("/requests/:reqId/accept", async (req, res) => {
     // confirming the same request twice).
     const updated = await RideRequest.findOneAndUpdate(
       { _id: reqDoc._id, status: "pending" },
-      { $set: { status: "accepted" } },
+      { $set: { status: "accepted", requestExpiresAt: null } }, // stop the auto-expiry clock
       { new: true }
     );
     if (!updated) {
@@ -1352,6 +1583,8 @@ router.post("/requests/:reqId/accept", async (req, res) => {
     notify(updated.riderPhone, "Ride Request Accepted",
       `Your request has been accepted. You can now view the permitted contact details for this confirmed ride.`,
       "/requests?tab=sent");
+    sendSms(updated.riderPhone,
+      `Vooggly: Your ride request was ACCEPTED. Open the app to view the driver's contact details.`);
     return res.json({ success: true, message: "Request accepted", data: updated });
   } catch (err) {
     console.error("acceptRequest error:", err);
@@ -1369,11 +1602,16 @@ router.post("/requests/:reqId/reject", async (req, res) => {
     }
     if (reqDoc.status !== "pending") return res.status(400).json({ success: false, message: `Request already ${reqDoc.status}` });
     reqDoc.status = "rejected";
+    reqDoc.requestExpiresAt = null;
     await reqDoc.save();
+    // Pay-first: a rejected request was already paid → auto-refund.
+    await refundRequestPayment(reqDoc, "rejected");
     const ride = await Ride.findById(reqDoc.rideId);
     notify(reqDoc.riderPhone, "Ride Request Update",
-      `Your request to join the ride was not accepted by the ride owner.`, "/requests?tab=sent");
-    return res.json({ success: true, message: "Request rejected", data: reqDoc });
+      `Your request to join the ride was not accepted by the ride owner. Your payment has been refunded.`, "/requests?tab=sent");
+    sendSms(reqDoc.riderPhone,
+      `Vooggly: Your ride request was not accepted. Your payment has been refunded.`);
+    return res.json({ success: true, message: "Request rejected and payment refunded", data: reqDoc });
   } catch (err) {
     console.error("rejectRequest error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -1391,8 +1629,15 @@ router.post("/requests/:reqId/cancel", async (req, res) => {
     if (!["pending", "accepted"].includes(reqDoc.status)) {
       return res.status(400).json({ success: false, message: `Request already ${reqDoc.status}` });
     }
+    // Refund only when cancelled BEFORE the owner accepted. Once accepted, the
+    // booking is confirmed and contact was unlocked, so no auto-refund.
+    const wasPendingUnaccepted = reqDoc.status === "pending";
     reqDoc.status = "cancelled";
+    reqDoc.requestExpiresAt = null;
     await reqDoc.save();
+    if (wasPendingUnaccepted) {
+      await refundRequestPayment(reqDoc, "cancelled_by_rider");
+    }
     const ride = await Ride.findById(reqDoc.rideId);
     notify(reqDoc.posterPhone, "Ride Request Cancelled",
       `A rider has cancelled their request to join your ride from ${ride?.from || ""} to ${ride?.to || ""}.`, "/requests");
