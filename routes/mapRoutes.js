@@ -48,6 +48,56 @@ router.get("/geocode", async (req, res) => {
 });
 
 // ============================================================
+// GET /api/autocomplete?q=tambaram
+// → { results: [ { name, sub, display_name, lat, lon }, ... ] }
+// Device-independent place search. Runs entirely server-side (Nominatim), so it
+// works on phones / in-app browsers where the client-side Google Maps JS SDK is
+// blocked by API-key referrer restrictions. Used by the location field as a
+// fallback when Google autocomplete isn't available.
+// ============================================================
+router.get("/autocomplete", async (req, res) => {
+  try {
+    const q = (req.query.q || "").trim();
+    if (!q) return res.json({ results: [] });
+
+    const r = await axios.get("https://nominatim.openstreetmap.org/search", {
+      params: {
+        q,
+        format: "json",
+        limit: 8,
+        countrycodes: "in",   // India only
+        addressdetails: 1,
+        "accept-language": "en",
+        dedupe: 1,
+      },
+      headers: { "User-Agent": UA, "Accept-Language": "en" },
+      timeout: 8000,
+    });
+
+    const rows = Array.isArray(r.data) ? r.data : [];
+    const results = rows.map((hit) => {
+      const parts = String(hit.display_name || "").split(",").map((s) => s.trim());
+      const a = hit.address || {};
+      const name =
+        a.city || a.town || a.village || a.suburb || a.neighbourhood ||
+        a.county || a.state_district || a.hamlet || parts[0] || hit.display_name;
+      const sub = parts.slice(1).join(", ") || "India";
+      return {
+        name,
+        sub,
+        display_name: hit.display_name,
+        lat: parseFloat(hit.lat),
+        lon: parseFloat(hit.lon),
+      };
+    });
+    return res.json({ results });
+  } catch (err) {
+    console.error("autocomplete error:", err.message);
+    return res.json({ results: [] }); // never break the UI — just no suggestions
+  }
+});
+
+// ============================================================
 // GET /api/route?fromLat=..&fromLng=..&toLat=..&toLng=..
 // → { distance: "460 km", duration: "7 hr 30 min", geometry: [[lon,lat], ...] }
 // ============================================================
