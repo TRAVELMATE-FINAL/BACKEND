@@ -55,42 +55,124 @@ router.get("/geocode", async (req, res) => {
 // blocked by API-key referrer restrictions. Used by the location field as a
 // fallback when Google autocomplete isn't available.
 // ============================================================
-router.get("/autocomplete", async (req, res) => {
+// Google Places Text Search (New) — best quality + typo tolerance
+// ("thambaram" → "Tambaram"). Runs server-side with a server key (NOT the
+// browser key, which is HTTP-referrer restricted), so it works on every device.
+// Returns places WITH coordinates in one call. Enabled only when a server key
+// is configured: set GOOGLE_PLACES_API_KEY (or GOOGLE_MAPS_API_KEY) on the
+// server to a key that has "Places API (New)" enabled and either no referrer
+// restriction or an IP/none restriction.
+const GOOGLE_KEY = process.env.GOOGLE_PLACES_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "";
+async function googleSearch(q) {
+  if (!GOOGLE_KEY) return [];
   try {
-    const q = (req.query.q || "").trim();
-    if (!q) return res.json({ results: [] });
+    const r = await axios.post(
+      "https://places.googleapis.com/v1/places:searchText",
+      { textQuery: q, regionCode: "IN", languageCode: "en" },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": GOOGLE_KEY,
+          "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location",
+        },
+        timeout: 8000,
+      }
+    );
+    const places = (r.data && r.data.places) || [];
+    return places
+      .map((p) => {
+        const name = (p.displayName && p.displayName.text) || "";
+        const addr = p.formattedAddress || "";
+        const loc = p.location || {};
+        // secondary = the address minus the leading name, for a clean subtitle.
+        let sub = addr;
+        if (name && addr.startsWith(name)) sub = addr.slice(name.length).replace(/^[,\s]+/, "");
+        return {
+          name: name || addr,
+          sub: sub || "India",
+          display_name: addr || name,
+          lat: loc.latitude,
+          lon: loc.longitude,
+        };
+      })
+      .filter((r) => r.name && Number.isFinite(r.lat) && Number.isFinite(r.lon));
+  } catch (e) {
+    console.error("googleSearch error:", e.response?.status, e.response?.data?.error?.message || e.message);
+    return [];
+  }
+}
 
+// Photon (komoot) — free, no API key, built for type-ahead. Handles partial and
+// slightly misspelled input ("thambara" → "Tambaram") far better than Nominatim.
+async function photonSearch(q) {
+  try {
+    const r = await axios.get("https://photon.komoot.io/api/", {
+      params: { q, limit: 10, lang: "en", lat: 22.0, lon: 79.0 }, // bias toward India
+      headers: { "User-Agent": UA },
+      timeout: 8000,
+    });
+    const feats = (r.data && r.data.features) || [];
+    return feats
+      .filter((f) => {
+        const p = f.properties || {};
+        return (p.countrycode === "IN") || /india/i.test(p.country || "");
+      })
+      .map((f) => {
+        const p = f.properties || {};
+        const coords = (f.geometry && f.geometry.coordinates) || [];
+        const name = p.name || p.city || p.street || p.county || p.state || "";
+        const subParts = [p.city, p.county, p.state, p.country]
+          .filter((x) => x && x !== name);
+        const sub = [...new Set(subParts)].join(", ") || "India";
+        return {
+          name,
+          sub,
+          display_name: [name, ...subParts].filter(Boolean).join(", "),
+          lat: parseFloat(coords[1]),
+          lon: parseFloat(coords[0]),
+        };
+      })
+      .filter((r) => r.name && Number.isFinite(r.lat) && Number.isFinite(r.lon));
+  } catch (e) {
+    return [];
+  }
+}
+
+// Nominatim backup.
+async function nominatimSearch(q) {
+  try {
     const r = await axios.get("https://nominatim.openstreetmap.org/search", {
-      params: {
-        q,
-        format: "json",
-        limit: 8,
-        countrycodes: "in",   // India only
-        addressdetails: 1,
-        "accept-language": "en",
-        dedupe: 1,
-      },
+      params: { q, format: "json", limit: 8, countrycodes: "in", addressdetails: 1, "accept-language": "en", dedupe: 1 },
       headers: { "User-Agent": UA, "Accept-Language": "en" },
       timeout: 8000,
     });
-
     const rows = Array.isArray(r.data) ? r.data : [];
-    const results = rows.map((hit) => {
+    return rows.map((hit) => {
       const parts = String(hit.display_name || "").split(",").map((s) => s.trim());
       const a = hit.address || {};
       const name =
         a.city || a.town || a.village || a.suburb || a.neighbourhood ||
         a.county || a.state_district || a.hamlet || parts[0] || hit.display_name;
       const sub = parts.slice(1).join(", ") || "India";
-      return {
-        name,
-        sub,
-        display_name: hit.display_name,
-        lat: parseFloat(hit.lat),
-        lon: parseFloat(hit.lon),
-      };
+      return { name, sub, display_name: hit.display_name, lat: parseFloat(hit.lat), lon: parseFloat(hit.lon) };
     });
-    return res.json({ results });
+  } catch (e) {
+    return [];
+  }
+}
+
+router.get("/autocomplete", async (req, res) => {
+  try {
+    const q = (req.query.q || "").trim();
+    if (!q) return res.json({ results: [] });
+
+    // Google (best, typo-tolerant) when a server key is configured, else the
+    // free geocoders. Each returns [] on failure so we always fall through.
+    let results = await googleSearch(q);
+    if (!results.length) results = await photonSearch(q);
+    if (!results.length) results = await nominatimSearch(q);
+
+    return res.json({ results: results.slice(0, 8) });
   } catch (err) {
     console.error("autocomplete error:", err.message);
     return res.json({ results: [] }); // never break the UI — just no suggestions
