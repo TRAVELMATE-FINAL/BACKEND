@@ -13,6 +13,7 @@ const mapRoutes          = require("./routes/mapRoutes");
 const planRoutes         = require("./routes/planRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
 const userActionsRoutes  = require("./routes/userActionsRoutes");
+const busRouteRoutes     = require("./routes/busRouteRoutes");
 
 const app = express();
 
@@ -68,6 +69,7 @@ app.use("/api",               mapRoutes);
 app.use("/api/plans",         planRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/users",         userActionsRoutes);
+app.use("/api/bus-routes",     busRouteRoutes);
 
 // ----- Root: simple healthcheck + route listing -----
 app.get("/", function (_req, res) {
