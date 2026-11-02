@@ -41,6 +41,20 @@ function rideStatusLabel(ride) {
   return "active";
 }
 
+// Vehicle name / model validation — must be a real name, not blank, numbers
+// only, or symbols only. Allows real model names with digits (e.g. "Swift
+// Dzire", "i20", "CB350"). Returns "" when valid, else an error message.
+function validateVehicleName(raw) {
+  const v = String(raw || "").trim();
+  if (v.length < 2) return "Please enter a valid vehicle name";
+  if (v.length > 40) return "Vehicle name is too long (max 40 characters)";
+  if (!/^[A-Za-z0-9][A-Za-z0-9 .&'-]*$/.test(v)) return "Vehicle name can't contain special characters";
+  const letters = (v.match(/[A-Za-z]/g) || []).length;
+  if (letters < 2) return "Vehicle name must contain letters, not just numbers or symbols";
+  if (/^(.)\1+$/.test(v.replace(/\s/g, ""))) return "Please enter a valid vehicle name";
+  return "";
+}
+
 // Fire-and-forget notification creator.
 async function notify(userPhone, title, body, to) {
   try {
@@ -323,6 +337,15 @@ router.post("/", async (req, res) => {
         error: "'From' and 'To' cannot be the same location",
         message: "'From' and 'To' cannot be the same location",
       });
+    }
+    // ── Vehicle name validation (server-side) — must be a real name, not
+    // blank / numbers-only / symbols-only. Mirrors the client check so the
+    // API can't be bypassed with junk. ──
+    {
+      const vmsg = validateVehicleName(vehicleModel);
+      if (vmsg) {
+        return res.status(400).json({ success: false, error: vmsg, message: vmsg });
+      }
     }
     if (date < todayStr()) {
       return res.status(400).json({
@@ -1178,6 +1201,10 @@ router.patch("/:id", async (req, res) => {
           ride[k] = Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
         } else if (k === "plateNumber") {
           ride[k] = String(req.body[k] || "").toUpperCase().replace(/[\s-]/g, "");
+        } else if (k === "vehicleModel") {
+          const vmsg = validateVehicleName(req.body[k]);
+          if (vmsg) return res.status(400).json({ success: false, error: vmsg, message: vmsg });
+          ride[k] = String(req.body[k]).trim();
         } else {
           ride[k] = req.body[k];
         }
