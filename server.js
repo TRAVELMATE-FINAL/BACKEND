@@ -14,6 +14,7 @@ const planRoutes         = require("./routes/planRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
 const userActionsRoutes  = require("./routes/userActionsRoutes");
 const busRouteRoutes     = require("./routes/busRouteRoutes");
+const liveRideRoutes     = require("./routes/liveRideRoutes");
 
 const app = express();
 
@@ -70,6 +71,7 @@ app.use("/api/plans",         planRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/users",         userActionsRoutes);
 app.use("/api/bus-routes",     busRouteRoutes);
+app.use("/api/live-rides",     liveRideRoutes);
 
 // ----- Root: simple healthcheck + route listing -----
 app.get("/", function (_req, res) {
