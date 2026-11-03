@@ -23,6 +23,14 @@ const samePhone = (a, b) => {
   const nb = String(b || "").replace(/\D/g, "").slice(-10);
   return na.length === 10 && na === nb;
 };
+// All stored forms a phone might take, for matching inside the passengers array.
+const phoneVariantsOf = (raw) => {
+  const last10 = String(raw || "").replace(/\D/g, "").slice(-10);
+  const set = new Set();
+  if (raw) set.add(String(raw).trim());
+  if (last10.length === 10) { set.add("+91" + last10); set.add("91" + last10); set.add(last10); }
+  return [...set];
+};
 
 async function findUser(phone) {
   const n = normalizePhone(phone);
@@ -283,29 +291,59 @@ router.post("/:id/join-verify", async (req, res) => {
       return res.status(401).json({ success: false, message: "Payment could not be verified." });
     }
 
-    // Seats may have filled while paying → refund, don't confirm.
-    if (ride.status !== "live" || confirmed(ride) >= ride.totalSeats) {
+    // Ensure this rider has a (non-confirmed) passenger entry to flip — create
+    // one if missing (e.g. order entry was lost), still as pending.
+    if (!p) {
+      ride.passengers.push({
+        phone: riderPhone, name: member.fullName || "", photo: member.photo || "",
+        isHost: false, status: "pending", paymentOrderId: razorpay_order_id,
+      });
+      await ride.save();
+    }
+
+    // ── ATOMIC confirm: single-document update that only succeeds if the ride
+    // is live AND a seat is genuinely free (confirmed count < totalSeats). This
+    // makes overbooking impossible even if two riders pay for the last seat at
+    // the same instant — at most one update matches. ──
+    const variants = phoneVariantsOf(riderPhone);
+    const updated = await LiveRide.findOneAndUpdate(
+      {
+        _id: ride._id,
+        status: "live",
+        passengers: { $elemMatch: { phone: { $in: variants }, status: { $ne: "confirmed" } } },
+        $expr: {
+          $lt: [
+            { $size: { $filter: { input: "$passengers", as: "p", cond: { $eq: ["$$p.status", "confirmed"] } } } },
+            "$totalSeats",
+          ],
+        },
+      },
+      {
+        $set: {
+          "passengers.$.status": "confirmed",
+          "passengers.$.paymentId": razorpay_payment_id,
+          "passengers.$.amountPaid": ride.farePerSeat,
+          "passengers.$.joinedAt": new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (!updated) {
+      // No free seat (or ride ended) → refund and mark refunded.
       try {
         const client = planCtrl.getRazorpayClient();
         if (client) await client.payments.refund(razorpay_payment_id, { amount: Math.round(Number(ride.farePerSeat) * 100), speed: "normal", notes: { reason: "live_ride_full" } });
       } catch {}
-      if (p) { p.status = "refunded"; await ride.save(); }
+      await LiveRide.updateOne(
+        { _id: ride._id, passengers: { $elemMatch: { phone: { $in: variants }, status: "pending" } } },
+        { $set: { "passengers.$.status": "refunded" } }
+      );
       return res.status(409).json({ success: false, refunded: true, message: "The ride just became full. Your payment has been refunded." });
     }
 
-    if (p) {
-      p.status = "confirmed"; p.paymentId = razorpay_payment_id;
-      p.amountPaid = ride.farePerSeat; p.joinedAt = new Date();
-    } else {
-      ride.passengers.push({
-        phone: riderPhone, name: member.fullName || "", photo: member.photo || "",
-        isHost: false, status: "confirmed", paymentId: razorpay_payment_id, amountPaid: ride.farePerSeat, joinedAt: new Date(),
-      });
-    }
-    await ride.save();
-
-    notify(ride.hostPhone, "New co-passenger", `${member.fullName || "A member"} joined your live ride ${ride.from} → ${ride.to}.`, "/live-rides");
-    return res.json({ success: true, data: publicView(ride, riderPhone) });
+    notify(updated.hostPhone, "New co-passenger", `${member.fullName || "A member"} joined your live ride ${updated.from} → ${updated.to}.`, "/live-rides");
+    return res.json({ success: true, data: publicView(updated, riderPhone) });
   } catch (err) {
     console.error("liveRide join-verify error:", err.message);
     return res.status(500).json({ success: false, message: "Could not confirm your seat." });
