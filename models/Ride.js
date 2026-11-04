@@ -43,8 +43,13 @@ const rideSchema = new mongoose.Schema(
     toLon:   { type: Number, default: null },
 
     // ── Connect/Unlock fields ─────────────────────────────────────
+    // User ID of the user who posted this ride.
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
     // Phone of the user who posted this ride. Used to look up name/photo.
     userPhone: { type: String, default: "", trim: true },
+
+    // Linked LiveRide if live tracking is enabled for this ride
+    liveRideId: { type: mongoose.Schema.Types.ObjectId, ref: "LiveRide", index: true },
 
     // Vehicle info shown on Connect page (Figma)
     vehicle:      { type: String, default: "Bike", trim: true },     // "Car" | "Bike"
@@ -69,11 +74,11 @@ const rideSchema = new mongoose.Schema(
     smokingAllowed: { type: Boolean, default: false },
 
     // Lifecycle status. "active" by default; becomes "expired" automatically
-    // once the ride's date+time passes, or "closed" if the owner closes it.
-    // Expired/closed rides are excluded from search and can't take requests.
+    // once the ride's date+time passes, or "closed"/"completed"/"cancelled" if the owner closes/completes/cancels it.
+    // Expired/closed/completed/cancelled rides are excluded from search and can't take requests.
     status: {
       type: String,
-      enum: ["active", "expired", "closed"],
+      enum: ["active", "expired", "closed", "completed", "cancelled"],
       default: "active",
       index: true,
     },

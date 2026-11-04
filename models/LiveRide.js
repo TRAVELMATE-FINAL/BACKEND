@@ -8,6 +8,7 @@ const mongoose = require("mongoose");
 
 const passengerSchema = new mongoose.Schema(
   {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     phone: { type: String, required: true, trim: true },
     name: { type: String, default: "" },
     photo: { type: String, default: "" },
@@ -24,8 +25,10 @@ const passengerSchema = new mongoose.Schema(
 
 const liveRideSchema = new mongoose.Schema(
   {
+    hostId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
     hostPhone: { type: String, required: true, trim: true, index: true },
     hostName: { type: String, default: "" },
+    rideId: { type: mongoose.Schema.Types.ObjectId, ref: "Ride", index: true },
 
     vehicle: {
       type: { type: String, default: "Car", trim: true }, // Car / Bike
@@ -41,7 +44,7 @@ const liveRideSchema = new mongoose.Schema(
     totalSeats: { type: Number, required: true, min: 1, max: 20 },
     farePerSeat: { type: Number, required: true, min: 0 },
 
-    status: { type: String, enum: ["live", "ended"], default: "live", index: true },
+    status: { type: String, enum: ["live", "ended", "completed", "cancelled"], default: "live", index: true },
 
     // Latest GPS position pushed by the host device.
     currentLat: { type: Number, default: null },

@@ -7,7 +7,9 @@ const mongoose = require("mongoose");
 const rideRequestSchema = new mongoose.Schema(
   {
     rideId:      { type: mongoose.Schema.Types.ObjectId, ref: "Ride", required: true, index: true },
+    posterId:    { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
     posterPhone: { type: String, required: true, trim: true, index: true }, // ride owner
+    riderId:     { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
     riderPhone:  { type: String, required: true, trim: true, index: true }, // requester
 
     // Snapshot of the requester's profile (so the owner sees who's asking).

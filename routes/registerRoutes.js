@@ -366,27 +366,26 @@ router.post("/profile", async (req, res) => {
 // ======================
 router.get("/profile", async (req, res) => {
   try {
-    const { phone } = req.query;
+    const { phone, userId } = req.query;
 
-    if (!phone) {
+    if (!phone && !userId) {
       return res.status(400).json({
-        message: "Phone is required",
+        message: "Phone or userId is required",
       });
     }
 
-    const cleanPhone = phone.replace("+91", "");
-
-    if (!/^\d{10}$/.test(cleanPhone)) {
-      return res.status(400).json({
-        message: "Invalid phone number",
-      });
+    let user = null;
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      user = await User.findById(userId);
     }
-
-    const fullPhone = `+91${cleanPhone}`;
-
-    console.log("🔍 Fetching profile for:", fullPhone);
-
-    const user = await User.findOne({ phone: fullPhone });
+    if (!user && phone) {
+      const cleanPhone = String(phone).replace("+91", "").replace(/\D/g, "");
+      if (cleanPhone.length >= 10) {
+        const fullPhone = `+91${cleanPhone.slice(-10)}`;
+        user = await User.findOne({ phone: fullPhone });
+        if (!user) user = await User.findOne({ phone: { $regex: cleanPhone.slice(-10) + "$" } });
+      }
+    }
 
     if (!user) {
       return res.status(404).json({

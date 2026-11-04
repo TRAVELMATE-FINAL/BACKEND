@@ -8,9 +8,11 @@ const crypto = require("crypto");
 const router = express.Router();
 
 const LiveRide = require("../models/LiveRide");
+const Ride = require("../models/Ride");
 const User = require("../models/User");
 const Notification = require("../models/Notification");
 const planCtrl = require("../controllers/planController");
+const { getUserActiveRideStatus } = require("./rideRoutes");
 
 const normalizePhone = (raw) => {
   const digits = String(raw || "").replace(/\D/g, "");
@@ -220,7 +222,28 @@ router.post("/:id/join-order", async (req, res) => {
     if (!member) return;
     const ride = await LiveRide.findById(req.params.id);
     if (!ride || ride.status !== "live") return res.status(404).json({ success: false, message: "This live ride is no longer available." });
-    if (samePhone(ride.hostPhone, riderPhone)) return res.status(400).json({ success: false, message: "You are the host of this ride." });
+    if (samePhone(ride.hostPhone, riderPhone) || (ride.hostId && member._id && String(ride.hostId) === String(member._id))) {
+      return res.status(400).json({ success: false, message: "You are the host of this ride." });
+    }
+
+    // ── Ride Creator Restriction ──
+    const activeStatus = await getUserActiveRideStatus({ userId: member?._id || req.body?.userId, phone: riderPhone });
+    if (activeStatus.hasActiveCreatedRide) {
+      return res.status(403).json({
+        success: false,
+        code: "ACTIVE_RIDE_EXISTS",
+        message: "You have already started a ride. You cannot join another ride until your current ride is completed or cancelled.",
+        activeRideId: activeStatus.activeRideId,
+      });
+    }
+    if (activeStatus.hasActiveJoinedRide) {
+      return res.status(403).json({
+        success: false,
+        code: "ACTIVE_JOINED_RIDE_EXISTS",
+        message: "You have already joined an active ride as a passenger.",
+        activeRideId: activeStatus.activeRideId,
+      });
+    }
 
     const already = (ride.passengers || []).find((p) => samePhone(p.phone, riderPhone) && p.status === "confirmed");
     if (already) return res.status(409).json({ success: false, message: "You have already joined this ride." });
@@ -249,9 +272,14 @@ router.post("/:id/join-order", async (req, res) => {
         notes: { liveRideId: String(ride._id), riderPhone, purpose: "live_ride_join" },
       });
     }
-    if (p) { p.status = "pending"; p.paymentOrderId = order.id; p.name = member.fullName || p.name; }
-    else {
+    if (p) {
+      p.status = "pending";
+      p.paymentOrderId = order.id;
+      p.name = member.fullName || p.name;
+      p.userId = member._id || p.userId;
+    } else {
       ride.passengers.push({
+        userId: member._id,
         phone: riderPhone, name: member.fullName || "", photo: member.photo || "",
         isHost: false, status: "pending", paymentOrderId: order.id,
       });
@@ -291,10 +319,26 @@ router.post("/:id/join-verify", async (req, res) => {
       return res.status(401).json({ success: false, message: "Payment could not be verified." });
     }
 
+    // Double check that rider does not have an active created ride
+    const activeCheck = await getUserActiveRideStatus({ userId: member?._id, phone: riderPhone });
+    if (activeCheck.hasActiveCreatedRide) {
+      try {
+        const client = planCtrl.getRazorpayClient();
+        if (client) await client.payments.refund(razorpay_payment_id, { amount: Math.round(Number(ride.farePerSeat) * 100), speed: "normal", notes: { reason: "driver_has_active_ride" } });
+      } catch {}
+      return res.status(403).json({
+        success: false,
+        refunded: true,
+        code: "ACTIVE_RIDE_EXISTS",
+        message: "You have already started a ride. You cannot join another ride until your current ride is completed or cancelled. Your payment has been refunded.",
+      });
+    }
+
     // Ensure this rider has a (non-confirmed) passenger entry to flip — create
     // one if missing (e.g. order entry was lost), still as pending.
     if (!p) {
       ride.passengers.push({
+        userId: member._id,
         phone: riderPhone, name: member.fullName || "", photo: member.photo || "",
         isHost: false, status: "pending", paymentOrderId: razorpay_order_id,
       });
@@ -360,6 +404,11 @@ router.post("/:id/stop", async (req, res) => {
     if (ride.status === "ended") return res.json({ success: true, data: publicView(ride, phone) });
     ride.status = "ended"; ride.endedAt = new Date();
     await ride.save();
+
+    if (ride.rideId) {
+      await Ride.findByIdAndUpdate(ride.rideId, { status: "completed" });
+    }
+
     (ride.passengers || []).forEach((p) => {
       if (!p.isHost && p.status === "confirmed") {
         notify(p.phone, "Live ride ended", `Your live ride ${ride.from} → ${ride.to} has ended.`, "/live-rides");

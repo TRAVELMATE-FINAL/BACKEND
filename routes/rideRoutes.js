@@ -5,6 +5,7 @@
 const express = require("express");
 const router = express.Router();
 const crypto = require("crypto");
+const mongoose = require("mongoose");
 
 const Ride = require("../models/Ride");
 const User = require("../models/User");
@@ -12,6 +13,7 @@ const Booking = require("../models/Booking");
 const Notification = require("../models/Notification");
 const RideRequest = require("../models/RideRequest");
 const Subscription = require("../models/Subscription");
+const LiveRide = require("../models/LiveRide");
 const planCtrl = require("../controllers/planController");
 
 // ============================================================
@@ -20,7 +22,7 @@ const planCtrl = require("../controllers/planController");
 
 // ── Expiry helpers ──────────────────────────────────────────
 // A ride is expired once its date+time has passed, OR it's been
-// closed/expired explicitly. Enforced on the backend for search + direct
+// closed/completed/cancelled/expired explicitly. Enforced on the backend for search + direct
 // access so old posts can never be returned or requested.
 function rideDateTime(ride) {
   if (!ride || !ride.date) return null;
@@ -30,13 +32,15 @@ function rideDateTime(ride) {
 }
 function isRideExpired(ride) {
   if (!ride) return true;
-  if (ride.status === "closed" || ride.status === "expired") return true;
+  if (ride.status === "closed" || ride.status === "expired" || ride.status === "completed" || ride.status === "cancelled") return true;
   const dt = rideDateTime(ride);
   if (!dt) return false; // no parseable datetime → don't hide it
   return dt.getTime() < Date.now();
 }
 function rideStatusLabel(ride) {
   if (ride.status === "closed") return "closed";
+  if (ride.status === "completed") return "completed";
+  if (ride.status === "cancelled") return "cancelled";
   if (ride.status === "expired" || isRideExpired(ride)) return "expired";
   return "active";
 }
@@ -252,6 +256,18 @@ const normalizePhone = (raw) => {
   return "+91" + last10;
 };
 
+// All stored forms a phone might take (e.g. +91XXXXXXXXXX, 91XXXXXXXXXX, XXXXXXXXXX)
+const phoneVariantsOf = (raw) => {
+  const s = String(raw || "").trim();
+  const last10 = s.replace(/\D/g, "").slice(-10);
+  const list = s ? [s] : [];
+  if (last10.length === 10) list.push("+91" + last10, "91" + last10, last10);
+  return [...new Set(list)];
+};
+
+const samePhone = (a, b) =>
+  phoneVariantsOf(a).some((v) => phoneVariantsOf(b).includes(v));
+
 // "+919876543210" → "+91 98*****210"
 const maskPhone = (phone) => {
   if (!phone) return "";
@@ -287,6 +303,128 @@ const findUserByPhone = async (phone) => {
   return null;
 };
 
+// Resolve user document by userId (ObjectId) or phone
+const resolveUser = async ({ userId, phone }) => {
+  if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+    const u = await User.findById(userId);
+    if (u) return u;
+  }
+  if (phone) {
+    return await findUserByPhone(phone);
+  }
+  return null;
+};
+
+// Check if a user currently has an active ride they created (as driver) OR an active ride they joined (as passenger).
+// Validates using the user's ID as well as their phone number.
+const getUserActiveRideStatus = async ({ userId, phone }) => {
+  const user = await resolveUser({ userId, phone });
+  const targetUserId = user?._id || (userId && mongoose.Types.ObjectId.isValid(userId) ? userId : null);
+  const targetPhone = user?.phone || normalizePhone(phone);
+  const variants = targetPhone ? phoneVariantsOf(targetPhone) : [];
+
+  if (!targetUserId && !variants.length) {
+    return { hasActiveCreatedRide: false, hasActiveJoinedRide: false, activeRide: null, activeType: null };
+  }
+
+  // 1. Check if user is creator of an active Ride
+  const rideConditions = [];
+  if (targetUserId) rideConditions.push({ userId: targetUserId });
+  if (variants.length) rideConditions.push({ userPhone: { $in: variants } });
+
+  const activeCreatedRides = await Ride.find({
+    $or: rideConditions,
+    status: "active",
+  }).sort({ createdAt: -1 });
+
+  for (const r of activeCreatedRides) {
+    if (!isRideExpired(r)) {
+      return {
+        hasActiveCreatedRide: true,
+        hasActiveJoinedRide: false,
+        activeRide: r,
+        activeRideId: r._id,
+        activeType: "posted",
+        isCreator: true,
+        message: "You have already started a ride. You cannot join another ride until your current ride is completed or cancelled."
+      };
+    }
+  }
+
+  // 2. Check if user is host of an active LiveRide
+  const liveConditions = [];
+  if (targetUserId) liveConditions.push({ hostId: targetUserId });
+  if (variants.length) liveConditions.push({ hostPhone: { $in: variants } });
+
+  const activeLiveRides = await LiveRide.find({
+    $or: liveConditions,
+    status: "live",
+  }).sort({ createdAt: -1 });
+
+  if (activeLiveRides.length > 0) {
+    return {
+      hasActiveCreatedRide: true,
+      hasActiveJoinedRide: false,
+      activeRide: activeLiveRides[0],
+      activeRideId: activeLiveRides[0]._id,
+      activeType: "live",
+      isCreator: true,
+      message: "You have already started a ride. You cannot join another ride until your current ride is completed or cancelled."
+    };
+  }
+
+  // 3. Check if user is an accepted passenger in an active Ride
+  const requestConditions = [];
+  if (targetUserId) requestConditions.push({ riderId: targetUserId });
+  if (variants.length) requestConditions.push({ riderPhone: { $in: variants } });
+
+  const joinedRequests = await RideRequest.find({
+    $or: requestConditions,
+    status: "accepted",
+  }).populate("rideId");
+
+  for (const req of joinedRequests) {
+    const r = req.rideId;
+    if (r && r.status === "active" && !isRideExpired(r)) {
+      return {
+        hasActiveCreatedRide: false,
+        hasActiveJoinedRide: true,
+        activeRide: r,
+        activeRideId: r._id,
+        activeType: "posted_passenger",
+        isCreator: false,
+        message: "You have already joined an active ride as a passenger."
+      };
+    }
+  }
+
+  // 4. Check if user is a confirmed passenger in an active LiveRide
+  const joinedLiveRides = await LiveRide.find({
+    status: "live",
+    passengers: {
+      $elemMatch: {
+        ...(variants.length ? { phone: { $in: variants } } : {}),
+        isHost: false,
+        status: "confirmed",
+      }
+    }
+  });
+
+  if (joinedLiveRides.length > 0) {
+    return {
+      hasActiveCreatedRide: false,
+      hasActiveJoinedRide: true,
+      activeRide: joinedLiveRides[0],
+      activeRideId: joinedLiveRides[0]._id,
+      activeType: "live_passenger",
+      isCreator: false,
+      message: "You have already joined an active live ride as a passenger."
+    };
+  }
+
+  return { hasActiveCreatedRide: false, hasActiveJoinedRide: false, activeRide: null, activeType: null };
+};
+
 // Auth gate for paid booking actions: the rider must be a real, verified,
 // non-blocked account. On failure it sends the response and returns null.
 const requireVerifiedRider = async (phone, res) => {
@@ -311,6 +449,20 @@ const requireVerifiedRider = async (phone, res) => {
   }
   return u;
 };
+
+// ============================================================
+// GET /api/rides/user-active-status — checks if user has active created/joined ride
+// ============================================================
+router.get("/user-active-status", async (req, res) => {
+  try {
+    const { userId, phone } = req.query;
+    const status = await getUserActiveRideStatus({ userId, phone });
+    return res.json({ success: true, ...status });
+  } catch (err) {
+    console.error("user-active-status error:", err);
+    return res.status(500).json({ success: false, message: "Could not check user active status" });
+  }
+});
 
 // ============================================================
 // POST /api/rides — create a new ride
@@ -366,6 +518,31 @@ router.post("/", async (req, res) => {
     // User.phone (which is always saved with the +91 prefix). This
     // makes the driver-name lookup on /details / /connect deterministic.
     const normalizedUserPhone = normalizePhone(userPhone);
+    const resolvedUser = await resolveUser({ userId: req.body?.userId, phone: normalizedUserPhone });
+    const resolvedUserId = resolvedUser?._id || (req.body?.userId && mongoose.Types.ObjectId.isValid(req.body.userId) ? req.body.userId : null);
+
+    // ── Active Ride Restriction (Creator / Driver) ───────────────────
+    // Prevent users from creating conflicting active rides.
+    // If the user already has an active created ride, they cannot create another until completed/cancelled.
+    const activeCheck = await getUserActiveRideStatus({ userId: resolvedUserId, phone: normalizedUserPhone });
+    if (activeCheck.hasActiveCreatedRide) {
+      return res.status(409).json({
+        success: false,
+        code: "ACTIVE_RIDE_EXISTS",
+        error: "You have already started a ride. You cannot start another ride until your current ride is completed or cancelled.",
+        message: "You have already started a ride. You cannot start another ride until your current ride is completed or cancelled.",
+        activeRideId: activeCheck.activeRideId,
+      });
+    }
+    if (activeCheck.hasActiveJoinedRide) {
+      return res.status(409).json({
+        success: false,
+        code: "ACTIVE_JOINED_RIDE_EXISTS",
+        error: "You are currently a passenger on an active ride. You cannot create a ride until your current ride is completed or cancelled.",
+        message: "You are currently a passenger on an active ride. You cannot create a ride until your current ride is completed or cancelled.",
+        activeRideId: activeCheck.activeRideId,
+      });
+    }
 
     // ── Duplicate-ride guard ─────────────────────────────────────────
     // The SAME user may not have two ACTIVE rides at the same date + time.
@@ -422,6 +599,7 @@ router.post("/", async (req, res) => {
       fromLon: fromLon ?? null,
       toLat:   toLat   ?? null,
       toLon:   toLon   ?? null,
+      userId:  resolvedUserId,
       userPhone: normalizedUserPhone,
       vehicle: vehicle || "Bike",
       vehicleModel: vehicleModel || "",
@@ -433,6 +611,48 @@ router.post("/", async (req, res) => {
       petAllowed: derivePetAllowed(additionalInfo),
       smokingAllowed: deriveSmokingAllowed(additionalInfo),
     });
+
+    // Seamlessly integrate live ride tracking: auto-create LiveRide so
+    // driver location and live sharing work out of the box with the existing post-ride form.
+    try {
+      const liveRide = await LiveRide.create({
+        hostId: resolvedUserId,
+        hostPhone: normalizedUserPhone,
+        hostName: resolvedUser?.fullName || "",
+        rideId: ride._id,
+        vehicle: {
+          type: vehicle || "Car",
+          model: vehicleModel || "",
+          color: vehicleColor || "",
+          plate: plateNumber || "",
+        },
+        from: from.trim(),
+        to: to.trim(),
+        departureTime: `${date} ${time}`,
+        totalSeats: typeof seatsAvailable === "number" ? seatsAvailable : 1,
+        farePerSeat: typeof farePerSeat === "number" ? Math.max(0, farePerSeat) : 0,
+        currentLat: fromLat ?? null,
+        currentLon: fromLon ?? null,
+        destLat: toLat ?? null,
+        destLon: toLon ?? null,
+        lastLocationAt: (fromLat != null && fromLon != null) ? new Date() : null,
+        status: "live",
+        passengers: [{
+          userId: resolvedUserId,
+          phone: normalizedUserPhone,
+          name: resolvedUser?.fullName || "",
+          photo: resolvedUser?.photo || "",
+          isHost: true,
+          status: "confirmed",
+          amountPaid: 0,
+          joinedAt: new Date(),
+        }],
+      });
+      ride.liveRideId = liveRide._id;
+      await ride.save();
+    } catch (liveErr) {
+      console.warn("LiveRide auto-creation non-fatal note:", liveErr?.message);
+    }
 
     return res.status(201).json({
       success: true,
@@ -1261,6 +1481,11 @@ router.delete("/:id", async (req, res) => {
     }
 
     await Ride.deleteOne({ _id: ride._id });
+    if (ride.liveRideId) {
+      await LiveRide.findByIdAndUpdate(ride.liveRideId, { status: "ended", endedAt: new Date() });
+    }
+    await LiveRide.deleteMany({ rideId: ride._id });
+
     return res.status(200).json({
       success: true,
       message: "Ride deleted",
@@ -1280,15 +1505,6 @@ router.delete("/:id", async (req, res) => {
 // REQUEST TO RIDE — request / accept / reject / cancel / close
 // Contact is revealed only once a request is ACCEPTED.
 // ============================================================
-const phoneVariantsOf = (raw) => {
-  const s = String(raw || "").trim();
-  const last10 = s.replace(/\D/g, "").slice(-10);
-  const list = s ? [s] : [];
-  if (last10.length === 10) list.push("+91" + last10, "91" + last10, last10);
-  return [...new Set(list)];
-};
-const samePhone = (a, b) =>
-  phoneVariantsOf(a).some((v) => phoneVariantsOf(b).includes(v));
 
 // DEPRECATED — the old FREE request endpoint. The flow is now PAY-FIRST, so a
 // request can no longer be created for free. A stale client hitting this is
@@ -1301,7 +1517,7 @@ router.post("/:id/request", async (req, res) => {
   });
 });
 
-// POST /api/rides/:id/request-order  { riderPhone, message? }
+// POST /api/rides/:id/request-order  { riderPhone, userId?, message? }
 // PAY-FIRST step 1: validate eligibility and create (or reuse) a Razorpay order
 // for the booking fee. Creates a hidden "awaiting_payment" request that holds
 // the order. The owner is NOT notified yet — the request is only sent after the
@@ -1314,11 +1530,35 @@ router.post("/:id/request-order", async (req, res) => {
     // Auth gate: only a real, verified account may request/pay.
     if (!(await requireVerifiedRider(riderPhone, res))) return;
 
+    const rider = await resolveUser({ userId: req.body?.userId, phone: riderPhone });
+    const riderUserId = rider?._id || (req.body?.userId && mongoose.Types.ObjectId.isValid(req.body.userId) ? req.body.userId : null);
+
     const ride = await Ride.findById(req.params.id);
     if (!ride) return res.status(404).json({ success: false, message: "Ride not found" });
     if (isRideExpired(ride)) return res.status(400).json({ success: false, message: "This ride has expired or been closed" });
-    if (samePhone(ride.userPhone, riderPhone)) {
+    if (samePhone(ride.userPhone, riderPhone) || (riderUserId && ride.userId && String(riderUserId) === String(ride.userId))) {
       return res.status(400).json({ success: false, message: "You can't request your own ride" });
+    }
+
+    // ── Ride Creator Restriction ──────────────────────────────────────────
+    // Once a user posts/starts a ride, that user becomes the ride creator and driver.
+    // The same user must NOT be allowed to join another ride while their created ride is active.
+    const activeStatus = await getUserActiveRideStatus({ userId: riderUserId, phone: riderPhone });
+    if (activeStatus.hasActiveCreatedRide) {
+      return res.status(403).json({
+        success: false,
+        code: "ACTIVE_RIDE_EXISTS",
+        message: "You have already started a ride. You cannot join another ride until your current ride is completed or cancelled.",
+        activeRideId: activeStatus.activeRideId,
+      });
+    }
+    if (activeStatus.hasActiveJoinedRide) {
+      return res.status(403).json({
+        success: false,
+        code: "ACTIVE_JOINED_RIDE_EXISTS",
+        message: "You have already joined another active ride as a passenger.",
+        activeRideId: activeStatus.activeRideId,
+      });
     }
 
     // Duplicate guard — one live request per rider per ride.
@@ -1345,9 +1585,10 @@ router.post("/:id/request-order", async (req, res) => {
     if (!client) return res.status(500).json({ success: false, message: "Payment is temporarily unavailable. Please try again later." });
     const KEY = process.env.RAZORPAY_KEY_ID;
 
-    const rider = await findUserByPhone(riderPhone);
     const snap = {
+      posterId: ride.userId || null,
       posterPhone: ride.userPhone,
+      riderId: riderUserId,
       riderPhone,
       riderName: rider?.fullName || "",
       riderPhoto: rider?.photo || "",
@@ -1424,6 +1665,22 @@ router.post("/requests/:reqId/request-pay-verify", async (req, res) => {
       .digest("hex");
     if (expected !== razorpay_signature) {
       return res.status(401).json({ success: false, message: "Payment could not be verified." });
+    }
+
+    // Double check that rider does not have an active created ride
+    const activeCheck = await getUserActiveRideStatus({ userId: reqDoc.riderId, phone: reqDoc.riderPhone });
+    if (activeCheck.hasActiveCreatedRide) {
+      reqDoc.paymentStatus = "paid"; reqDoc.paymentId = razorpay_payment_id;
+      reqDoc.amountPaid = reqDoc.amountDue; reqDoc.paidAt = new Date();
+      reqDoc.status = "cancelled";
+      await reqDoc.save();
+      await refundRequestPayment(reqDoc, "driver_has_active_ride");
+      return res.status(403).json({
+        success: false,
+        refunded: true,
+        code: "ACTIVE_RIDE_EXISTS",
+        message: "You have already started a ride. You cannot join another ride until your current ride is completed or cancelled. Your payment has been refunded.",
+      });
     }
 
     const ride = await Ride.findById(reqDoc.rideId);
@@ -1863,20 +2120,33 @@ router.post("/requests/mark-paid", async (req, res) => {
   }
 });
 
-// POST /api/rides/:id/close  { ownerPhone }  — owner closes ride; cascade
+// POST /api/rides/:id/close  { ownerPhone, userId }  — owner closes ride; cascade
 router.post("/:id/close", async (req, res) => {
   try {
     const ride = await Ride.findById(req.params.id);
     if (!ride) return res.status(404).json({ success: false, message: "Ride not found" });
-    if (!samePhone(ride.userPhone, req.body?.ownerPhone)) {
+    const user = await resolveUser({ userId: req.body?.userId, phone: req.body?.ownerPhone });
+    const isOwner = (user && ride.userId && String(user._id) === String(ride.userId)) ||
+                    samePhone(ride.userPhone, req.body?.ownerPhone || user?.phone);
+    if (!isOwner) {
       return res.status(403).json({ success: false, message: "Not authorized" });
     }
     ride.status = "closed";
     await ride.save();
+
+    if (ride.liveRideId) {
+      await LiveRide.findByIdAndUpdate(ride.liveRideId, { status: "ended", endedAt: new Date() });
+    } else {
+      await LiveRide.updateMany({ rideId: ride._id, status: "live" }, { status: "ended", endedAt: new Date() });
+    }
+
     const pend = await RideRequest.find({ rideId: ride._id, status: { $in: ["pending", "accepted"] } });
     for (const r of pend) {
       r.status = "cancelled";
       await r.save();
+      if (r.paymentStatus === "paid") {
+        await refundRequestPayment(r, "ride_closed_by_owner");
+      }
       notify(r.riderPhone, "Ride Closed",
         `The ride from ${ride.from} to ${ride.to} has been closed by the owner. Your request has been cancelled.`, "");
     }
@@ -1886,5 +2156,89 @@ router.post("/:id/close", async (req, res) => {
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
+
+// POST /api/rides/:id/complete  { ownerPhone, userId } — owner marks ride completed
+router.post("/:id/complete", async (req, res) => {
+  try {
+    const ride = await Ride.findById(req.params.id);
+    if (!ride) return res.status(404).json({ success: false, message: "Ride not found" });
+    const user = await resolveUser({ userId: req.body?.userId, phone: req.body?.ownerPhone });
+    const isOwner = (user && ride.userId && String(user._id) === String(ride.userId)) ||
+                    samePhone(ride.userPhone, req.body?.ownerPhone || user?.phone);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, message: "Only the ride creator can complete this ride" });
+    }
+    ride.status = "completed";
+    await ride.save();
+
+    if (ride.liveRideId) {
+      await LiveRide.findByIdAndUpdate(ride.liveRideId, { status: "completed", endedAt: new Date() });
+    } else {
+      await LiveRide.updateMany({ rideId: ride._id, status: "live" }, { status: "completed", endedAt: new Date() });
+    }
+
+    const accepted = await RideRequest.find({ rideId: ride._id, status: "accepted" });
+    for (const r of accepted) {
+      notify(
+        r.riderPhone,
+        "Ride Completed",
+        `Your ride from ${ride.from} to ${ride.to} has been completed. Thank you for travelling with Vooggly!`,
+        "/profile-settings"
+      );
+    }
+
+    return res.json({ success: true, message: "Ride marked as completed", data: { _id: ride._id, status: "completed" } });
+  } catch (err) {
+    console.error("completeRide error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// POST /api/rides/:id/cancel  { ownerPhone, userId, reason? } — owner cancels ride
+router.post("/:id/cancel", async (req, res) => {
+  try {
+    const ride = await Ride.findById(req.params.id);
+    if (!ride) return res.status(404).json({ success: false, message: "Ride not found" });
+    const user = await resolveUser({ userId: req.body?.userId, phone: req.body?.ownerPhone });
+    const isOwner = (user && ride.userId && String(user._id) === String(ride.userId)) ||
+                    samePhone(ride.userPhone, req.body?.ownerPhone || user?.phone);
+    if (!isOwner) {
+      return res.status(403).json({ success: false, message: "Only the ride creator can cancel this ride" });
+    }
+    ride.status = "cancelled";
+    await ride.save();
+
+    if (ride.liveRideId) {
+      await LiveRide.findByIdAndUpdate(ride.liveRideId, { status: "cancelled", endedAt: new Date() });
+    } else {
+      await LiveRide.updateMany({ rideId: ride._id, status: "live" }, { status: "cancelled", endedAt: new Date() });
+    }
+
+    const activeRequests = await RideRequest.find({ rideId: ride._id, status: { $in: ["pending", "accepted"] } });
+    for (const r of activeRequests) {
+      r.status = "cancelled";
+      await r.save();
+      if (r.paymentStatus === "paid") {
+        await refundRequestPayment(r, "ride_cancelled_by_driver");
+      }
+      notify(
+        r.riderPhone,
+        "Ride Cancelled",
+        `The ride from ${ride.from} to ${ride.to} has been cancelled by the driver. Any payments made have been refunded.`,
+        "/profile-settings"
+      );
+    }
+
+    return res.json({ success: true, message: "Ride cancelled successfully", data: { _id: ride._id, status: "cancelled" } });
+  } catch (err) {
+    console.error("cancelRide error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+router.getUserActiveRideStatus = getUserActiveRideStatus;
+router.resolveUser = resolveUser;
+router.phoneVariantsOf = phoneVariantsOf;
+router.samePhone = samePhone;
 
 module.exports = router;
