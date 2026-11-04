@@ -42,6 +42,23 @@ const rideSchema = new mongoose.Schema(
     toLat:   { type: Number, default: null },
     toLon:   { type: Number, default: null },
 
+    // Intermediate stops along the route (in travel order). Each carries its
+    // own coordinates where available so Find Ride can match a searched
+    // location against a stop (not just the from/to), by distance + text.
+    stops: {
+      type: [
+        new mongoose.Schema(
+          {
+            name: { type: String, required: true, trim: true },
+            lat: { type: Number, default: null },
+            lon: { type: Number, default: null },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
+
     // ── Connect/Unlock fields ─────────────────────────────────────
     // User ID of the user who posted this ride.
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },

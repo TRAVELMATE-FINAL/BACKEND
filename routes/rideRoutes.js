@@ -473,8 +473,20 @@ router.post("/", async (req, res) => {
       from, to, date, time, gender, distance, duration,
       fromLat, fromLon, toLat, toLon,
       userPhone, vehicle, vehicleModel, vehicleColor, plateNumber,
-      seatsAvailable, farePerSeat, additionalInfo,
+      seatsAvailable, farePerSeat, additionalInfo, stops,
     } = req.body;
+
+    // Normalize intermediate stops → [{ name, lat, lon }], dropping blanks.
+    const cleanStops = Array.isArray(stops)
+      ? stops
+          .map((s) => (typeof s === "string" ? { name: s } : s))
+          .map((s) => ({
+            name: String(s?.name || "").trim(),
+            lat: Number.isFinite(Number(s?.lat)) ? Number(s.lat) : null,
+            lon: Number.isFinite(Number(s?.lon)) ? Number(s.lon) : null,
+          }))
+          .filter((s) => s.name)
+      : [];
 
     if (!from || !to || !date || !time || !gender || !distance || !duration) {
       return res.status(400).json({
@@ -611,6 +623,7 @@ router.post("/", async (req, res) => {
       plateNumber:  plateNumber  || "",
       seatsAvailable: typeof seatsAvailable === "number" ? seatsAvailable : 1,
       farePerSeat: typeof farePerSeat === "number" ? Math.max(0, farePerSeat) : 0,
+      stops: cleanStops,
       additionalInfo: additionalInfo || "",
       petAllowed: derivePetAllowed(additionalInfo),
       smokingAllowed: deriveSmokingAllowed(additionalInfo),
@@ -1012,11 +1025,40 @@ router.get("/search", async (req, res) => {
       );
     }
 
+    // Evaluate a search term/geo against a RANGE of the ordered route sequence
+    // (start → stops → end) and return the best-matching point WITH its index,
+    // so we can enforce boarding-before-dropping. idx = -1 when unconstrained.
+    const bestMatch = (term, gLat, gLon, hasGeo, seq, lo, hi) => {
+      if (!term && !hasGeo) return { pass: true, dist: 0, exact: false, idx: -1 };
+      let best = { pass: false, dist: Infinity, exact: false, idx: -1 };
+      for (let i = lo; i <= hi; i++) {
+        const p = seq[i];
+        if (!p) continue;
+        const r = evalField(term, gLat, gLon, hasGeo, p.lat, p.lon, p.name);
+        if (r.pass && (!best.pass || r.dist < best.dist || (r.exact && !best.exact))) {
+          best = { ...r, idx: i };
+        }
+      }
+      return best;
+    };
+
     const scored = [];
     for (const r of candidates) {
-      const fromR = evalField(fromT, fLat, fLon, hasFromGeo, r.fromLat, r.fromLon, r.from);
-      const toR   = evalField(toT,   tLat, tLon, hasToGeo,   r.toLat,   r.toLon,   r.to);
+      const stopPts = (r.stops || []).map((s) => ({ lat: s.lat, lon: s.lon, name: s.name }));
+      // Ordered route: start (0) → stops (1..n) → end (last).
+      const seq = [
+        { lat: r.fromLat, lon: r.fromLon, name: r.from },
+        ...stopPts,
+        { lat: r.toLat, lon: r.toLon, name: r.to },
+      ];
+      // Boarding can be the start or any stop (not the final destination);
+      // dropping can be any stop or the destination (not the start).
+      const fromR = bestMatch(fromT, fLat, fLon, hasFromGeo, seq, 0, seq.length - 2);
+      const toR   = bestMatch(toT,   tLat, tLon, hasToGeo,   seq, 1, seq.length - 1);
       if (!fromR.pass || !toR.pass) continue;
+      // Boarding must come before dropping on the route (when both are pinned to
+      // a specific point). Skips reverse-direction false matches.
+      if (fromR.idx >= 0 && toR.idx >= 0 && fromR.idx >= toR.idx) continue;
 
       const dist =
         (Number.isFinite(fromR.dist) ? fromR.dist : 0) +
@@ -1027,7 +1069,19 @@ router.get("/search", async (req, res) => {
 
     // Prioritise exact matches, then nearest by combined distance.
     scored.sort((a, b) => (b.exactScore - a.exactScore) || (a.dist - b.dist));
-    const rides = scored.map((s) => s.ride);
+    let rides = scored.map((s) => s.ride);
+
+    // ── Only show rides that still have a free seat ──────────────────────
+    // Confirmed (accepted) requests occupy seats; a ride whose seats are all
+    // taken is hidden from search.
+    if (rides.length) {
+      const counts = await confirmedCountsFor(rides.map((r) => r._id));
+      rides = rides.filter((r) => {
+        const total = typeof r.seatsAvailable === "number" ? r.seatsAvailable : 1;
+        const taken = counts.get(String(r._id)) || 0;
+        return total - taken > 0;
+      });
+    }
 
     if (rides.length === 0) {
       return res.status(200).json({
@@ -1107,6 +1161,7 @@ router.get("/:id/connect", async (req, res) => {
           fromLon: ride.fromLon,
           toLat: ride.toLat,
           toLon: ride.toLon,
+          stops: ride.stops || [],
           vehicle: ride.vehicle || "Bike",
           vehicleModel: ride.vehicleModel || "",
           vehicleColor: ride.vehicleColor || "",
@@ -1224,6 +1279,7 @@ router.get("/:id/details", async (req, res) => {
           fromLon: ride.fromLon,
           toLat: ride.toLat,
           toLon: ride.toLon,
+          stops: ride.stops || [],
           vehicle: ride.vehicle || "Bike",
           vehicleModel: ride.vehicleModel || "",
           vehicleColor: ride.vehicleColor || "",
