@@ -525,7 +525,11 @@ router.post("/", async (req, res) => {
     // Prevent users from creating conflicting active rides.
     // If the user already has an active created ride, they cannot create another until completed/cancelled.
     const activeCheck = await getUserActiveRideStatus({ userId: resolvedUserId, phone: normalizedUserPhone });
-    if (activeCheck.hasActiveCreatedRide) {
+    // IMPORTANT: Live Rides are a SEPARATE workflow and must NOT block normal
+    // posting (per spec: keep them separate / don't disturb normal Post Ride).
+    // So only a conflicting NORMAL posted ride blocks a new normal post —
+    // hosting or joining a Live Ride does not.
+    if (activeCheck.hasActiveCreatedRide && activeCheck.activeType === "posted") {
       return res.status(409).json({
         success: false,
         code: "ACTIVE_RIDE_EXISTS",
@@ -534,7 +538,7 @@ router.post("/", async (req, res) => {
         activeRideId: activeCheck.activeRideId,
       });
     }
-    if (activeCheck.hasActiveJoinedRide) {
+    if (activeCheck.hasActiveJoinedRide && activeCheck.activeType === "posted_passenger") {
       return res.status(409).json({
         success: false,
         code: "ACTIVE_JOINED_RIDE_EXISTS",
