@@ -20,6 +20,18 @@ const rideRequestSchema = new mongoose.Schema(
     // Optional note from the rider.
     message: { type: String, default: "", maxlength: 300 },
 
+    // ── Boarding / dropping selection + seats ───────────────────────────
+    // The rider picks where they get on and off along the driver's route
+    // (origin → intermediate stops → destination). boardingIndex/droppingIndex
+    // are positions in that ordered sequence (0 = origin, last = destination),
+    // used to enforce boarding-before-dropping. seatsRequested is how many
+    // seats this booking takes (≥ 1), which is what the seat accounting counts.
+    boardingPoint:  { type: String, default: "" },
+    droppingPoint:  { type: String, default: "" },
+    boardingIndex:  { type: Number, default: null },
+    droppingIndex:  { type: Number, default: null },
+    seatsRequested: { type: Number, default: 1, min: 1 },
+
     // Lifecycle. PAY-FIRST flow:
     //   awaiting_payment → (rider pays) → pending → accepted / rejected / expired
     // "awaiting_payment" is an internal holding state that owns the Razorpay

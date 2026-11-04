@@ -709,17 +709,23 @@ router.post("/", async (req, res) => {
 // seat frees automatically because we only ever count status === "accepted".
 const CONFIRMED_STATUS = "accepted"; // "accepted" == CONFIRMED in this codebase
 
-// Count confirmed requests for a single ride.
+// Count confirmed SEATS for a single ride. A booking may hold more than one
+// seat (seatsRequested), so we sum seats — not request documents. Legacy
+// requests created before multi-seat have no seatsRequested and count as 1.
 async function confirmedCountForRide(rideId) {
-  return RideRequest.countDocuments({ rideId, status: CONFIRMED_STATUS });
+  const rows = await RideRequest.aggregate([
+    { $match: { rideId: new mongoose.Types.ObjectId(String(rideId)), status: CONFIRMED_STATUS } },
+    { $group: { _id: null, seats: { $sum: { $ifNull: ["$seatsRequested", 1] } } } },
+  ]);
+  return rows.length ? rows[0].seats : 0;
 }
 
-// Batch: Map<rideId(string), confirmedCount> for a list of rides.
+// Batch: Map<rideId(string), confirmedSeatCount> for a list of rides.
 async function confirmedCountsFor(rideIds) {
   if (!rideIds || !rideIds.length) return new Map();
   const rows = await RideRequest.aggregate([
     { $match: { rideId: { $in: rideIds }, status: CONFIRMED_STATUS } },
-    { $group: { _id: "$rideId", n: { $sum: 1 } } },
+    { $group: { _id: "$rideId", n: { $sum: { $ifNull: ["$seatsRequested", 1] } } } },
   ]);
   const map = new Map();
   rows.forEach((r) => map.set(String(r._id), r.n));
@@ -743,15 +749,22 @@ const enrichRidesWithUser = async (rides) => {
   const counts = await confirmedCountsFor(rides.map((r) => r._id));
   const out = [];
   for (const r of rides) {
-    const user = await findUserByPhone(r.userPhone);
     const obj = r.toObject ? r.toObject() : r;
-    obj.driverName = user?.fullName?.trim() || "Vooggly Rider";
-    obj.driverPhoto = user?.photo || "";
-    obj.driverCity = user?.city || "";
+    // PRIVACY (backend-enforced): a public ride listing is pre-payment by
+    // nature, so it must NEVER carry the driver's identity or vehicle
+    // identifiers. Only the route, schedule, seats, price, vehicle TYPE
+    // (needed for the Car/Bike filter) and ride preferences are public.
+    // Real name, photo, city, vehicle model/colour, registration number and
+    // contact unlock only through /requests/outgoing once the booking is
+    // CONFIRMED + PAID.
+    obj.driverName = "Verified Vooggly Rider";
+    obj.driverPhoto = "";
+    obj.driverCity = "";
     // Never expose a phone/email typed into notes in public ride lists.
     obj.additionalInfo = sanitizeNotes(obj.additionalInfo);
-    // Vehicle registration number is private — never expose it in public
-    // lists. It unlocks only to the paid rider (via /requests/outgoing).
+    // Vehicle identity (model / colour / registration) is private pre-payment.
+    obj.vehicleModel = "";
+    obj.vehicleColor = "";
     obj.plateNumber = "";
     // Pet-allowed boolean: use the stored value, or back-derive from notes for
     // older rides that predate the field, so the filter matches consistently.
@@ -762,6 +775,25 @@ const enrichRidesWithUser = async (rides) => {
     out.push(obj);
   }
   return out;
+};
+
+// ── Reveal gate ─────────────────────────────────────────────────────
+// A viewer may see a ride's private driver + vehicle identity ONLY when
+// they hold a CONFIRMED (accepted) + PAID booking for that exact ride.
+// This is the single authoritative backend gate shared by /connect and
+// /details, matching /requests/outgoing and /:id/unlock. Without a paid,
+// accepted request the caller gets generic, non-identifying values.
+const viewerMaySeePrivate = async (rideId, viewerPhone) => {
+  if (!viewerPhone) return false;
+  const variants = phoneVariantsOf(viewerPhone);
+  if (!variants.length) return false;
+  const paidReq = await RideRequest.findOne({
+    rideId,
+    riderPhone: { $in: variants },
+    status: "accepted",
+    paymentStatus: "paid",
+  }).lean();
+  return !!paidReq;
 };
 
 // ============================================================
@@ -1133,12 +1165,16 @@ router.get("/:id/connect", async (req, res) => {
 
     const user = await findUserByPhone(ride.userPhone);
 
-    console.log(
-      `[connect] rideId=${id} userPhone="${ride.userPhone}" → user=${user?.fullName || "(not found)"}`
-    );
+    // PRIVACY: only a viewer with a CONFIRMED + PAID booking for this ride may
+    // see the driver's real identity + full vehicle details. The viewer is
+    // identified by ?phone= (their own session phone), exactly like the rest
+    // of the app's rider endpoints.
+    const viewerPhone = String(req.query.phone || "").trim();
+    const maySee = await viewerMaySeePrivate(ride._id, viewerPhone);
 
-    const driverName = user?.fullName?.trim() || "Vooggly Rider";
-    const driverPhone = ride.userPhone || "";
+    const driverName = maySee
+      ? (user?.fullName?.trim() || "Vooggly Rider")
+      : "Verified Vooggly Rider";
 
     // Seat availability — occupied seats = CONFIRMED (accepted) requests only.
     const totalSeats = typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
@@ -1162,10 +1198,10 @@ router.get("/:id/connect", async (req, res) => {
           toLat: ride.toLat,
           toLon: ride.toLon,
           stops: ride.stops || [],
-          vehicle: ride.vehicle || "Bike",
-          vehicleModel: ride.vehicleModel || "",
-          vehicleColor: ride.vehicleColor || "",
-          plateNumber: "", // vehicle registration locked until booking is paid
+          vehicle: ride.vehicle || "Bike", // vehicle TYPE is public (non-identifying)
+          vehicleModel: maySee ? (ride.vehicleModel || "") : "",
+          vehicleColor: maySee ? (ride.vehicleColor || "") : "",
+          plateNumber: maySee ? (ride.plateNumber || "") : "", // registration locked until confirmed + paid
           seatsAvailable: totalSeats,
           farePerSeat: ride.farePerSeat || 0,
           totalSeats,
@@ -1179,10 +1215,10 @@ router.get("/:id/connect", async (req, res) => {
         },
         user: {
           fullName: driverName,
-          photo: user?.photo || "",
-          city: user?.city || "",
-          // Contact is NOT exposed here — revealed only after the ride owner
-          // accepts the rider's request (see the /requests endpoints).
+          photo: maySee ? (user?.photo || "") : "",
+          city: maySee ? (user?.city || "") : "",
+          phone: maySee ? (ride.userPhone || "") : "",
+          // Contact is exposed ONLY to a confirmed, paid rider (maySee).
         },
       },
     });
@@ -1232,10 +1268,12 @@ router.get("/:id/details", async (req, res) => {
     }
 
     const user = await findUserByPhone(ride.userPhone);
-    console.log(
-      `[details] rideId=${id} userPhone="${ride.userPhone}" → ` +
-      `user=${user ? user.fullName || "(no fullName)" : "(not found)"}`
-    );
+
+    // PRIVACY: identify the viewer by their own ?phone= and reveal the real
+    // driver identity + vehicle details ONLY when they hold a confirmed + paid
+    // booking for this ride. Otherwise everything identifying is withheld.
+    const viewerPhone = String(req.query.phone || "").trim();
+    const maySee = await viewerMaySeePrivate(ride._id, viewerPhone);
 
     // Phones can be stored as +91… / 91… / bare 10-digits. Match any of
     // those forms when counting the driver's total posts.
@@ -1280,10 +1318,10 @@ router.get("/:id/details", async (req, res) => {
           toLat: ride.toLat,
           toLon: ride.toLon,
           stops: ride.stops || [],
-          vehicle: ride.vehicle || "Bike",
-          vehicleModel: ride.vehicleModel || "",
-          vehicleColor: ride.vehicleColor || "",
-          plateNumber: "", // vehicle registration locked until booking is paid
+          vehicle: ride.vehicle || "Bike", // vehicle TYPE is public (non-identifying)
+          vehicleModel: maySee ? (ride.vehicleModel || "") : "",
+          vehicleColor: maySee ? (ride.vehicleColor || "") : "",
+          plateNumber: maySee ? (ride.plateNumber || "") : "", // registration locked until confirmed + paid
           seatsAvailable: totalSeats,
           farePerSeat: ride.farePerSeat || 0,
           totalSeats,
@@ -1297,15 +1335,13 @@ router.get("/:id/details", async (req, res) => {
           status: rideStatusLabel(ride),
         },
         driver: {
-          fullName: user?.fullName?.trim() || "Vooggly Rider",
-          photo: user?.photo || "",
-          city: user?.city || "",
-          email: user?.email || "",
-          // Both forms — frontend can pick. RideDetail shows the
-          // unmasked phone since the user has already paid by the
-          // time they land on that page.
-          // Contact is NOT exposed publicly — revealed only after the ride
-          // owner accepts the rider's request (see the /requests endpoints).
+          // Identity is revealed ONLY to a confirmed, paid rider (maySee).
+          // Before that the viewer sees a neutral, non-identifying label.
+          fullName: maySee ? (user?.fullName?.trim() || "Vooggly Rider") : "Verified Vooggly Rider",
+          photo: maySee ? (user?.photo || "") : "",
+          city: maySee ? (user?.city || "") : "",
+          email: maySee ? (user?.email || "") : "",
+          phone: maySee ? (ride.userPhone || "") : "",
           stats: {
             totalPostedRides,
             upcomingRides,
@@ -1590,6 +1626,14 @@ router.post("/:id/request-order", async (req, res) => {
     // Auth gate: only a real, verified account may request/pay.
     if (!(await requireVerifiedRider(riderPhone, res))) return;
 
+    // Boarding / dropping / seats requested by the rider (optional — defaults
+    // to the full origin→destination for 1 seat). Validated against the ride's
+    // route below once the ride is loaded.
+    const reqBoarding = String(req.body?.boardingPoint || "").trim();
+    const reqDropping = String(req.body?.droppingPoint || "").trim();
+    let seatsWanted = parseInt(req.body?.seatsRequested, 10);
+    if (!Number.isInteger(seatsWanted) || seatsWanted < 1) seatsWanted = 1;
+
     const rider = await resolveUser({ userId: req.body?.userId, phone: riderPhone });
     const riderUserId = rider?._id || (req.body?.userId && mongoose.Types.ObjectId.isValid(req.body.userId) ? req.body.userId : null);
 
@@ -1627,11 +1671,47 @@ router.post("/:id/request-order", async (req, res) => {
       return res.status(409).json({ success: false, message: "You have already requested this ride.", data: { _id: reqDoc._id, status: reqDoc.status } });
     }
 
-    // Seat guard — no seats free (all confirmed) → can't request.
+    // ── Boarding / dropping validation against the ride's ordered route ──
+    // Sequence: origin (0) → intermediate stops (1..n) → destination (last).
+    const routeSeq = [
+      ride.from,
+      ...((ride.stops || []).map((s) => (s && s.name) || "").filter(Boolean)),
+      ride.to,
+    ];
+    const norm = (s) => String(s || "").trim().toLowerCase();
+    // Match a chosen point to a route position (exact, else contains either way).
+    const findIdx = (val) => {
+      const v = norm(val);
+      if (!v) return -1;
+      let i = routeSeq.findIndex((p) => norm(p) === v);
+      if (i >= 0) return i;
+      return routeSeq.findIndex((p) => norm(p).includes(v) || v.includes(norm(p)));
+    };
+    // Default to full journey when the rider didn't choose explicit points.
+    let boardingIndex = reqBoarding ? findIdx(reqBoarding) : 0;
+    let droppingIndex = reqDropping ? findIdx(reqDropping) : routeSeq.length - 1;
+    if (reqBoarding && boardingIndex < 0) {
+      return res.status(400).json({ success: false, message: "Boarding point is not on this ride's route." });
+    }
+    if (reqDropping && droppingIndex < 0) {
+      return res.status(400).json({ success: false, message: "Dropping point is not on this ride's route." });
+    }
+    // Boarding must come strictly before dropping in route order.
+    if (boardingIndex >= droppingIndex) {
+      return res.status(400).json({ success: false, message: "Your boarding point must come before your dropping point along the route." });
+    }
+    const boardingPoint = routeSeq[boardingIndex];
+    const droppingPoint = routeSeq[droppingIndex];
+
+    // Seat guard — the requested number of seats must fit in what's left.
     const totalSeats = typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
     const confirmedSeats = await confirmedCountForRide(ride._id);
-    if (confirmedSeats >= totalSeats) {
+    const seatsLeft = totalSeats - confirmedSeats;
+    if (seatsLeft <= 0) {
       return res.status(409).json({ success: false, message: "This ride is full — no seats are available." });
+    }
+    if (seatsWanted > seatsLeft) {
+      return res.status(409).json({ success: false, message: `Only ${seatsLeft} seat(s) left — please reduce the number of seats.` });
     }
 
     // Fee (admin-configured Find Ride daily price), in rupees.
@@ -1654,6 +1734,11 @@ router.post("/:id/request-order", async (req, res) => {
       riderPhoto: rider?.photo || "",
       riderCity: rider?.city || "",
       message,
+      boardingPoint,
+      droppingPoint,
+      boardingIndex,
+      droppingIndex,
+      seatsRequested: seatsWanted,
       status: "awaiting_payment",
       paymentStatus: "pending",
       amountDue: Number(feeRupees),
@@ -1753,10 +1838,12 @@ router.post("/requests/:reqId/request-pay-verify", async (req, res) => {
       await refundRequestPayment(reqDoc, "ride_unavailable");
       return res.status(409).json({ success: false, refunded: true, message: "This ride is no longer available. Your payment has been refunded." });
     }
-    // Seats may have filled while paying → refund, don't send.
+    // Seats may have filled while paying → refund, don't send. Accounts for
+    // the number of seats this booking needs (not just one).
     const totalSeats = typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
     const confirmedSeats = await confirmedCountForRide(ride._id);
-    if (confirmedSeats >= totalSeats) {
+    const needSeats = Math.max(1, Number(reqDoc.seatsRequested) || 1);
+    if (confirmedSeats + needSeats > totalSeats) {
       reqDoc.paymentStatus = "paid"; reqDoc.paymentId = razorpay_payment_id;
       reqDoc.amountPaid = reqDoc.amountDue; reqDoc.paidAt = new Date();
       reqDoc.status = "cancelled";
@@ -1809,6 +1896,10 @@ router.get("/requests/incoming", async (req, res) => {
         _id: r._id, status: r.status, message: r.message,
         paymentStatus: r.paymentStatus || "none",
         amountPaid: r.amountPaid || 0,
+        // Where the rider boards / drops and how many seats they booked.
+        boardingPoint: r.boardingPoint || (ride ? ride.from : ""),
+        droppingPoint: r.droppingPoint || (ride ? ride.to : ""),
+        seatsRequested: r.seatsRequested || 1,
         // Rider contact exposed to the owner only after the booking is
         // confirmed AND the rider has completed payment.
         rider: {
@@ -1867,6 +1958,10 @@ router.get("/requests/outgoing", async (req, res) => {
       }
       data.push({
         _id: r._id, status: r.status,
+        // Chosen boarding / dropping / seats for this booking.
+        boardingPoint: r.boardingPoint || (ride ? ride.from : ""),
+        droppingPoint: r.droppingPoint || (ride ? ride.to : ""),
+        seatsRequested: r.seatsRequested || 1,
         // Payment state travels alongside booking state so the UI can show
         // "Pay Now" for a CONFIRMED-but-unpaid booking (independent of seats).
         paymentStatus: r.paymentStatus || "none",
@@ -1907,10 +2002,18 @@ router.post("/requests/:reqId/accept", async (req, res) => {
     // are full every further accept is blocked here.
     const totalSeats = ride && typeof ride.seatsAvailable === "number" ? ride.seatsAvailable : 1;
     const confirmedSeats = await confirmedCountForRide(reqDoc.rideId);
-    if (confirmedSeats >= totalSeats) {
+    const wantSeats = Math.max(1, Number(reqDoc.seatsRequested) || 1);
+    const seatsLeft = totalSeats - confirmedSeats;
+    if (seatsLeft <= 0) {
       return res.status(409).json({
         success: false,
         message: "All seats for this ride are already filled. You can no longer accept this request.",
+      });
+    }
+    if (wantSeats > seatsLeft) {
+      return res.status(409).json({
+        success: false,
+        message: `This booking needs ${wantSeats} seat(s) but only ${seatsLeft} remain. You cannot accept it.`,
       });
     }
 
