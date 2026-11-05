@@ -175,6 +175,50 @@ exports.getMySubscription = async (req, res) => {
 };
 
 // ===========================================================
+// GET /api/plans/my?phone=+91...  — the user's full plan history
+// Returns every subscription this phone has purchased (newest first) with a
+// computed display status. Read-only; each user sees only their own plans.
+// ===========================================================
+exports.getMyPlans = async (req, res) => {
+  try {
+    const phone = normPhone(req.query.phone);
+    if (!phone) return res.status(400).json({ success: false, message: "Valid phone is required" });
+    // Only a real, logged-in account may read its plan history.
+    if (!(await requireLoggedInUser(phone, res))) return;
+
+    const now = new Date();
+    const subs = await Subscription.find({ phone }).sort({ createdAt: -1 });
+
+    const data = subs.map((s) => {
+      let status;
+      if (s.status === "cancelled") status = "cancelled";
+      else if (s.startDate && s.startDate > now) status = "pending";
+      else if (s.status === "active" && s.endDate > now) status = "active";
+      else status = "expired";
+      return {
+        _id: s._id,
+        plan: s.plan,                 // daily | monthly | yearly
+        purpose: s.purpose || "post", // post | find
+        amountPaid: s.amountPaid,
+        originalAmount: s.originalAmount,
+        couponCode: s.couponCode || "",
+        cashback: s.cashback || 0,
+        purchaseDate: s.createdAt,
+        startDate: s.startDate,
+        endDate: s.endDate,
+        status,
+      };
+    });
+
+    const active = data.find((d) => d.status === "active") || null;
+    return res.json({ success: true, count: data.length, active, data });
+  } catch (err) {
+    console.error("getMyPlans error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ===========================================================
 // POST /api/plans/coupon/apply   Body: { code, plan }
 // ===========================================================
 exports.applyCoupon = async (req, res) => {

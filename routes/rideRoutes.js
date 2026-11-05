@@ -940,6 +940,9 @@ router.get("/by-user", async (req, res) => {
 // ============================================================
 router.get("/search", async (req, res) => {
   try {
+    // Auto-update ride statuses first: rides whose scheduled date+time has
+    // passed flip active → expired, so completed/expired never surface here.
+    await sweepExpiredRides();
     // NOTE: date is intentionally NOT used to filter search results — users
     // can find rides without picking a date.
     const { from, to, gender, vehicle, fromLat, fromLon, toLat, toLon } = req.query;
@@ -1006,20 +1009,27 @@ router.get("/search", async (req, res) => {
     // text/similar-name query.
     let candidates;
     if (hasFromGeo || hasToGeo) {
-      const dbq = {};
+      const dbq = { status: "active" }; // only active rides (excludes completed/expired/cancelled/closed)
       if (genderT) dbq.gender = { $regex: `^${escapeRx(genderT)}$`, $options: "i" };
       candidates = await Ride.find(dbq).sort({ createdAt: -1 });
     } else {
-      const fieldMatch = (field, term) => {
-        const ors = [{ [field]: { $regex: escapeRx(term), $options: "i" } }];
-        tokensOf(term).forEach((t) =>
-          ors.push({ [field]: { $regex: escapeRx(t), $options: "i" } })
-        );
+      // A searched term may match the ride's start, destination OR any
+      // intermediate stop — so the DB pre-filter must look in all three
+      // (from / to / stops.name). The precise boarding-before-dropping ordering
+      // is then enforced in-memory below. Without the stops.name clause, a ride
+      // whose match is an intermediate stop would be filtered out here and never
+      // scored (the bug that hid stop-based searches with no coordinates).
+      const anyFieldMatch = (term) => {
+        const ors = [];
+        const terms = [term, ...tokensOf(term)];
+        ["from", "to", "stops.name"].forEach((field) => {
+          terms.forEach((t) => ors.push({ [field]: { $regex: escapeRx(t), $options: "i" } }));
+        });
         return { $or: ors };
       };
-      const and = [];
-      if (fromT)   and.push(fieldMatch("from", fromT));
-      if (toT)     and.push(fieldMatch("to", toT));
+      const and = [{ status: "active" }]; // only active rides
+      if (fromT)   and.push(anyFieldMatch(fromT));
+      if (toT)     and.push(anyFieldMatch(toT));
       if (genderT) and.push({ gender: { $regex: `^${escapeRx(genderT)}$`, $options: "i" } });
       candidates = await Ride.find(and.length ? { $and: and } : {}).sort({ createdAt: -1 });
     }

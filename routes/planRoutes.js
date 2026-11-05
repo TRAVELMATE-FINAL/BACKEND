@@ -6,6 +6,7 @@ const ctrl = require("../controllers/planController");
 router.get("/",            ctrl.getPlans);          // catalogue
 router.get("/find-fee",    ctrl.getFindFee);        // live unlock + processing fee
 router.get("/me",          ctrl.getMySubscription); // active sub for a phone
+router.get("/my",          ctrl.getMyPlans);        // full plan history for a phone
 router.get("/can-post",    ctrl.canPostRide);       // post-ride gate
 router.get("/can-find",    ctrl.canFindRide);       // find-ride (request) gate
 
