@@ -10,6 +10,7 @@ const router = express.Router();
 const LiveRide = require("../models/LiveRide");
 const Ride = require("../models/Ride");
 const User = require("../models/User");
+const Subscription = require("../models/Subscription");
 const Notification = require("../models/Notification");
 const planCtrl = require("../controllers/planController");
 const { getUserActiveRideStatus } = require("./rideRoutes");
@@ -110,6 +111,26 @@ router.post("/", async (req, res) => {
     const existing = await LiveRide.findOne({ hostPhone, status: "live" });
     if (existing) {
       return res.status(409).json({ success: false, message: "You already have a live ride running.", data: { _id: existing._id } });
+    }
+
+    // Active-plan gate (server-authoritative) — a live ride, like a posted ride,
+    // requires an active posting plan. Never charges twice: the frontend buys a
+    // plan first when needed, then returns to start the ride.
+    {
+      const planVariants = phoneVariantsOf(hostPhone);
+      const activePlan = await Subscription.findOne({
+        phone: { $in: planVariants.length ? planVariants : [hostPhone] },
+        purpose: { $ne: "find" },
+        status: "active",
+        endDate: { $gt: new Date() },
+      });
+      if (!activePlan) {
+        return res.status(402).json({
+          success: false,
+          code: "PLAN_REQUIRED",
+          message: "An active posting plan is required to start a live ride. Please choose a plan.",
+        });
+      }
     }
 
     const ride = await LiveRide.create({
