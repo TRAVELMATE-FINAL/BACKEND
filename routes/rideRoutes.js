@@ -560,6 +560,30 @@ router.post("/", async (req, res) => {
       });
     }
 
+    // ── Active-plan gate (server-authoritative) ──────────────────────
+    // A normal posted ride REQUIRES an active, valid Post plan. This is checked
+    // on the backend before saving so the plan can't be bypassed by calling the
+    // API directly. The driver never pays twice: if they already hold an active
+    // plan this passes; if they just purchased one, verifyPayment created it
+    // moments earlier so it's active here too. (Live Rides post to a different
+    // endpoint and are free, so they're unaffected.)
+    {
+      const planVariants = phoneVariantsOf(normalizedUserPhone);
+      const activePlan = await Subscription.findOne({
+        phone: { $in: planVariants.length ? planVariants : [normalizedUserPhone] },
+        purpose: { $ne: "find" },
+        status: "active",
+        endDate: { $gt: new Date() },
+      });
+      if (!activePlan) {
+        return res.status(402).json({
+          success: false,
+          code: "PLAN_REQUIRED",
+          message: "An active posting plan is required to post a ride. Please choose a plan.",
+        });
+      }
+    }
+
     // ── Duplicate-ride guard ─────────────────────────────────────────
     // The SAME user may not have two ACTIVE rides at the same date + time.
     // Independent of vehicle / from / to / seats. Different users, different
@@ -1125,17 +1149,59 @@ router.get("/search", async (req, res) => {
       });
     }
 
-    if (rides.length === 0) {
-      return res.status(200).json({
-        success: true,
-        count: 0,
-        message: "Ride not available",
-        data: [],
-      });
-    }
+    // ── Also include matching ACTIVE live rides ──────────────────────────
+    // Live Ride Sharing rides are searchable in Find Ride too. They match by the
+    // same ordered route logic (start → stops → destination, boarding before
+    // dropping) and are tagged isLive so the card routes to the live join flow.
+    const liveResults = [];
+    try {
+      const liveRides = await LiveRide.find({ status: "live" }).sort({ createdAt: -1 });
+      for (const lr of liveRides) {
+        const stopPts = (lr.stops || []).map((s) => ({ lat: s.lat, lon: s.lon, name: s.name }));
+        const seq = [
+          { lat: lr.fromLat, lon: lr.fromLon, name: lr.from },
+          ...stopPts,
+          { lat: (lr.toLat != null ? lr.toLat : lr.destLat), lon: (lr.toLon != null ? lr.toLon : lr.destLon), name: lr.to },
+        ];
+        const fromR = bestMatch(fromT, fLat, fLon, hasFromGeo, seq, 0, seq.length - 2);
+        const toR   = bestMatch(toT,   tLat, tLon, hasToGeo,   seq, 1, seq.length - 1);
+        if (!fromR.pass || !toR.pass) continue;
+        if (fromR.idx >= 0 && toR.idx >= 0 && fromR.idx >= toR.idx) continue;
+        if (vehicleT && String(lr.vehicle?.type || "").trim().toLowerCase() !== vehicleT) continue;
+        const confirmed = (lr.passengers || []).filter((p) => p.status === "confirmed").length;
+        const remaining = Math.max(0, (lr.totalSeats || 1) - confirmed);
+        if (remaining <= 0) continue; // only rides still accepting riders
+        liveResults.push({
+          _id: lr._id,
+          isLive: true,
+          liveRideId: lr._id,
+          from: lr.from, to: lr.to,
+          stops: lr.stops || [],
+          fromLat: lr.fromLat, fromLon: lr.fromLon,
+          toLat: (lr.toLat != null ? lr.toLat : lr.destLat),
+          toLon: (lr.toLon != null ? lr.toLon : lr.destLon),
+          vehicle: (lr.vehicle && lr.vehicle.type) || "Car",
+          vehicleModel: "", vehicleColor: "", plateNumber: "",
+          farePerSeat: lr.farePerSeat || 0,
+          seatsAvailable: lr.totalSeats || 1,
+          confirmedSeats: confirmed,
+          remainingSeats: remaining, seatsLeft: remaining, isFull: false,
+          driverName: "Verified Vooggly Rider", driverPhoto: "", driverCity: "",
+          additionalInfo: "", gender: "",
+          date: "", time: "",
+          viewCount: 0,
+          status: "active",
+          createdAt: lr.createdAt,
+        });
+      }
+    } catch (e) { /* non-fatal — live rides are a bonus layer on search */ }
 
-    const enriched = await enrichRidesWithUser(rides);
-    return res.status(200).json({ success: true, count: enriched.length, data: enriched });
+    const enriched = rides.length ? await enrichRidesWithUser(rides) : [];
+    const data = [...enriched, ...liveResults];
+    if (data.length === 0) {
+      return res.status(200).json({ success: true, count: 0, message: "Ride not available", data: [] });
+    }
+    return res.status(200).json({ success: true, count: data.length, data });
   } catch (err) {
     console.error("searchRides error:", err);
     return res.status(500).json({

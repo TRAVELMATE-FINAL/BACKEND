@@ -41,6 +41,22 @@ const liveRideSchema = new mongoose.Schema(
     to: { type: String, required: true, trim: true },
     departureTime: { type: String, default: "", trim: true },
 
+    // Route geometry so live rides are findable in Find Ride (same shape as a
+    // posted ride): origin/destination coordinates + ordered intermediate stops.
+    fromLat: { type: Number, default: null },
+    fromLon: { type: Number, default: null },
+    toLat:   { type: Number, default: null },
+    toLon:   { type: Number, default: null },
+    stops: {
+      type: [
+        new mongoose.Schema(
+          { name: { type: String, trim: true }, lat: { type: Number, default: null }, lon: { type: Number, default: null } },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
+
     totalSeats: { type: Number, required: true, min: 1, max: 20 },
     farePerSeat: { type: Number, required: true, min: 0 },
 

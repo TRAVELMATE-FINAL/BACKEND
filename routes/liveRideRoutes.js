@@ -124,6 +124,20 @@ router.post("/", async (req, res) => {
       from: String(b.from).trim(),
       to: String(b.to).trim(),
       departureTime: String(b.departureTime || "").trim(),
+      // Route coords + stops so the live ride is searchable in Find Ride.
+      fromLat: Number.isFinite(Number(b.fromLat)) ? Number(b.fromLat) : null,
+      fromLon: Number.isFinite(Number(b.fromLon)) ? Number(b.fromLon) : null,
+      toLat:   Number.isFinite(Number(b.toLat))   ? Number(b.toLat)   : null,
+      toLon:   Number.isFinite(Number(b.toLon))   ? Number(b.toLon)   : null,
+      stops: Array.isArray(b.stops)
+        ? b.stops
+            .map((s) => ({
+              name: String((s && s.name) || s || "").trim(),
+              lat: Number.isFinite(Number(s?.lat)) ? Number(s.lat) : null,
+              lon: Number.isFinite(Number(s?.lon)) ? Number(s.lon) : null,
+            }))
+            .filter((s) => s.name)
+        : [],
       totalSeats,
       farePerSeat,
       currentLat: Number.isFinite(Number(b.lat)) ? Number(b.lat) : null,
