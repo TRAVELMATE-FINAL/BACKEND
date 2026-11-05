@@ -599,12 +599,13 @@ exports.ensureCouponsSeeded = async () => {
 // amount stays centrally controlled from the admin panel.
 exports.getRazorpayClient = getRazorpay;
 
-// Booking fee in rupees = admin unlockFee + processingFee (min 1).
+// Booking fee in rupees = admin Find Ride Daily price (the SAME value shown
+// to the rider on the Pay Now button and in the confirmation popup, and the
+// SAME value charged by createOrder for purpose "booking"). Kept in sync so
+// the amount charged always equals the amount displayed. Admin-controlled.
 exports.loadBookingFee = async () => {
   const f = await loadFindFee();
-  const total = num(f.unlockFee, DEFAULTS.findRide.unlockFee) +
-                num(f.processingFee, DEFAULTS.findRide.processingFee);
-  return Math.max(1, total);
+  return Math.max(1, num(f.dailyPrice, DEFAULTS.findRide.dailyPrice));
 };
 
 // Compatibility export (defaults only; live values come from the DB).
