@@ -358,7 +358,7 @@ const getUserActiveRideStatus = async ({ userId, phone }) => {
 
   const activeLiveRides = await LiveRide.find({
     $or: liveConditions,
-    status: "live",
+    status: { $in: ["scheduled", "live", "in_progress"] },
   }).sort({ createdAt: -1 });
 
   if (activeLiveRides.length > 0) {
@@ -400,7 +400,7 @@ const getUserActiveRideStatus = async ({ userId, phone }) => {
 
   // 4. Check if user is a confirmed passenger in an active LiveRide
   const joinedLiveRides = await LiveRide.find({
-    status: "live",
+    status: { $in: ["scheduled", "live", "in_progress"] },
     passengers: {
       $elemMatch: {
         ...(variants.length ? { phone: { $in: variants } } : {}),
@@ -678,6 +678,7 @@ router.post("/", async (req, res) => {
         destLon: toLon ?? null,
         lastLocationAt: (fromLat != null && fromLon != null) ? new Date() : null,
         status: "live",
+        startedAt: new Date(),
         passengers: [{
           userId: resolvedUserId,
           phone: normalizedUserPhone,
@@ -1155,7 +1156,7 @@ router.get("/search", async (req, res) => {
     // dropping) and are tagged isLive so the card routes to the live join flow.
     const liveResults = [];
     try {
-      const liveRides = await LiveRide.find({ status: "live" }).sort({ createdAt: -1 });
+      const liveRides = await LiveRide.find({ status: { $in: ["scheduled", "live", "in_progress"] } }).sort({ createdAt: -1 });
       for (const lr of liveRides) {
         const stopPts = (lr.stops || []).map((s) => ({ lat: s.lat, lon: s.lon, name: s.name }));
         const seq = [
@@ -1175,6 +1176,9 @@ router.get("/search", async (req, res) => {
           _id: lr._id,
           isLive: true,
           liveRideId: lr._id,
+          liveStatus: lr.status,                    // "scheduled" | "live"
+          scheduledDate: lr.scheduledDate || "",
+          departureTime: lr.departureTime || "",
           from: lr.from, to: lr.to,
           stops: lr.stops || [],
           fromLat: lr.fromLat, fromLon: lr.fromLon,

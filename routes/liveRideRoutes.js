@@ -66,6 +66,45 @@ async function notify(userPhone, title, body, to) {
 
 const confirmed = (ride) => (ride.passengers || []).filter((p) => p.status === "confirmed").length;
 
+// Combine a "YYYY-MM-DD" date and "HH:MM" time into a Date (local server tz).
+// Returns null if either part is missing/unparseable.
+function toScheduledAt(dateStr, timeStr) {
+  const d = String(dateStr || "").trim();
+  const t = String(timeStr || "").trim();
+  if (!d) return null;
+  // Accept "HH:MM" (24h) or empty; default midnight if time missing.
+  const hhmm = /^(\d{1,2}):(\d{2})/.exec(t);
+  const when = new Date(d + "T" + (hhmm ? `${String(hhmm[1]).padStart(2, "0")}:${hhmm[2]}` : "00:00") + ":00");
+  return isNaN(when.getTime()) ? null : when;
+}
+
+// A live ride is "finished" once it reaches any terminal status.
+const TERMINAL = ["ended", "completed", "cancelled"];
+
+// When a scheduled ride's start time arrives, remind the host ONCE to begin the
+// journey. Called opportunistically from the list endpoint (no cron needed) so
+// it works on any host. Never starts tracking — only notifies.
+async function sweepDueScheduledLiveRides() {
+  try {
+    const now = new Date();
+    const due = await LiveRide.find({
+      status: "scheduled",
+      journeyStartNotifiedAt: null,
+      scheduledAt: { $ne: null, $lte: now },
+    }).limit(50);
+    for (const r of due) {
+      await notify(
+        r.hostPhone,
+        "Time to start your live ride",
+        `Your scheduled ride ${r.from} → ${r.to} is due. Open Live Rides and tap "Start Journey & Share Location" when you're ready to go.`,
+        "/live-rides"
+      );
+      r.journeyStartNotifiedAt = new Date();
+      await r.save();
+    }
+  } catch (_e) { /* non-fatal */ }
+}
+
 // Public-ish view of a ride for discovery (no private data).
 function publicView(ride, viewerPhone) {
   const occ = confirmed(ride);
@@ -81,7 +120,9 @@ function publicView(ride, viewerPhone) {
     totalSeats: ride.totalSeats,
     availableSeats: Math.max(0, ride.totalSeats - occ),
     farePerSeat: ride.farePerSeat,
-    status: ride.status,
+    status: ride.status,                     // scheduled | live | completed | …
+    scheduledDate: ride.scheduledDate || "",
+    scheduledAt: ride.scheduledAt || null,
     startedAt: ride.startedAt,
     isHost,
     joined: !!mine,
@@ -94,7 +135,10 @@ function publicView(ride, viewerPhone) {
   };
 }
 
-// ── START a live ride (host) ───────────────────────────────────────────────
+// ── SCHEDULE a live ride (host) ────────────────────────────────────────────
+// Creates the ride in "scheduled" status. It does NOT start GPS tracking and
+// does NOT share any location — the host begins the journey manually later via
+// POST /:id/begin. This supports posting a ride hours before departure.
 router.post("/", async (req, res) => {
   try {
     const hostPhone = normalizePhone(req.body?.hostPhone);
@@ -107,10 +151,38 @@ router.post("/", async (req, res) => {
     if (!b.from || !b.to) return res.status(400).json({ success: false, message: "From and To are required." });
     if (!totalSeats) return res.status(400).json({ success: false, message: "Enter the number of seats." });
 
-    // One active live ride per host at a time.
-    const existing = await LiveRide.findOne({ hostPhone, status: "live" });
+    // Two modes, chosen by the driver in the form:
+    //   instant   → start the journey & tracking right now (needs GPS)
+    //   scheduled → save for later; tracking starts manually at journey time
+    const mode = String(b.mode || (b.scheduledDate || b.date ? "scheduled" : "instant")).toLowerCase() === "scheduled"
+      ? "scheduled" : "instant";
+
+    // Scheduled start time = journey date + time (for the "time to start"
+    // reminder and display). departureTime holds the time string.
+    const scheduledDate = String(b.scheduledDate || b.date || "").trim();
+    const departureTime = String(b.departureTime || b.time || "").trim();
+    const scheduledAt = toScheduledAt(scheduledDate, departureTime);
+
+    // Instant rides must supply a first GPS fix up front (tracking begins now).
+    const lat = Number(b.lat), lon = Number(b.lon);
+    if (mode === "instant" && (!Number.isFinite(lat) || !Number.isFinite(lon))) {
+      return res.status(400).json({ success: false, code: "GPS_REQUIRED", message: "Location is required to start an instant live ride. Please enable GPS and try again." });
+    }
+    if (mode === "scheduled" && !scheduledDate) {
+      return res.status(400).json({ success: false, message: "Please choose the journey date and time for a scheduled ride." });
+    }
+
+    // One active/scheduled live ride per host at a time.
+    const existing = await LiveRide.findOne({ hostPhone, status: { $in: ["scheduled", "live", "in_progress"] } });
     if (existing) {
-      return res.status(409).json({ success: false, message: "You already have a live ride running.", data: { _id: existing._id } });
+      const running = existing.status === "live" || existing.status === "in_progress";
+      return res.status(409).json({
+        success: false,
+        message: running
+          ? "You already have a live ride running."
+          : "You already have a scheduled live ride. Start or cancel it before scheduling another.",
+        data: { _id: existing._id, status: existing.status },
+      });
     }
 
     // Active-plan gate (server-authoritative) — a live ride, like a posted ride,
@@ -144,7 +216,9 @@ router.post("/", async (req, res) => {
       },
       from: String(b.from).trim(),
       to: String(b.to).trim(),
-      departureTime: String(b.departureTime || "").trim(),
+      departureTime,
+      scheduledDate,
+      scheduledAt,
       // Route coords + stops so the live ride is searchable in Find Ride.
       fromLat: Number.isFinite(Number(b.fromLat)) ? Number(b.fromLat) : null,
       fromLon: Number.isFinite(Number(b.fromLon)) ? Number(b.fromLon) : null,
@@ -161,11 +235,15 @@ router.post("/", async (req, res) => {
         : [],
       totalSeats,
       farePerSeat,
-      currentLat: Number.isFinite(Number(b.lat)) ? Number(b.lat) : null,
-      currentLon: Number.isFinite(Number(b.lon)) ? Number(b.lon) : null,
-      destLat: Number.isFinite(Number(b.destLat)) ? Number(b.destLat) : null,
-      destLon: Number.isFinite(Number(b.destLon)) ? Number(b.destLon) : null,
-      lastLocationAt: (Number.isFinite(Number(b.lat)) && Number.isFinite(Number(b.lon))) ? new Date() : null,
+      // Instant → live + tracking now. Scheduled → no location until the host
+      // begins the journey. Destination coords are kept for the map in both.
+      status: mode === "instant" ? "live" : "scheduled",
+      startedAt: mode === "instant" ? new Date() : null,
+      currentLat: mode === "instant" ? lat : null,
+      currentLon: mode === "instant" ? lon : null,
+      destLat: Number.isFinite(Number(b.destLat)) ? Number(b.destLat) : (Number.isFinite(Number(b.toLat)) ? Number(b.toLat) : null),
+      destLon: Number.isFinite(Number(b.destLon)) ? Number(b.destLon) : (Number.isFinite(Number(b.toLon)) ? Number(b.toLon) : null),
+      lastLocationAt: mode === "instant" ? new Date() : null,
       // Host occupies the first seat.
       passengers: [{
         phone: hostPhone, name: host.fullName || "", photo: host.photo || "",
@@ -177,6 +255,56 @@ router.post("/", async (req, res) => {
   } catch (err) {
     console.error("liveRide start error:", err.message);
     return res.status(500).json({ success: false, message: "Could not start live ride." });
+  }
+});
+
+// ── BEGIN the journey (host, manual) ───────────────────────────────────────
+// Flips a scheduled ride to live and records the FIRST GPS fix. Tracking only
+// starts here — never automatically at the scheduled time. GPS is mandatory.
+router.post("/:id/begin", async (req, res) => {
+  try {
+    const hostPhone = normalizePhone(req.body?.hostPhone);
+    const host = await requireMember(hostPhone, res);
+    if (!host) return;
+
+    const lat = Number(req.body?.lat), lon = Number(req.body?.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({ success: false, code: "GPS_REQUIRED", message: "Location is required to start the journey. Please enable GPS and try again." });
+    }
+
+    const ride = await LiveRide.findById(req.params.id);
+    if (!ride) return res.status(404).json({ success: false, message: "Live ride not found." });
+    if (!samePhone(ride.hostPhone, hostPhone)) {
+      return res.status(403).json({ success: false, message: "Only the host can start this journey." });
+    }
+    // Already running → idempotent success (lets a retry resume tracking).
+    if (ride.status === "live" || ride.status === "in_progress") {
+      ride.currentLat = lat; ride.currentLon = lon; ride.lastLocationAt = new Date();
+      await ride.save();
+      return res.json({ success: true, alreadyLive: true, data: publicView(ride, hostPhone) });
+    }
+    if (ride.status !== "scheduled") {
+      return res.status(400).json({ success: false, message: "This ride can no longer be started." });
+    }
+
+    ride.status = "live";
+    ride.startedAt = new Date();
+    ride.currentLat = lat;
+    ride.currentLon = lon;
+    ride.lastLocationAt = new Date();
+    await ride.save();
+
+    // Tell confirmed passengers the driver has started and is now trackable.
+    (ride.passengers || []).forEach((p) => {
+      if (!p.isHost && p.status === "confirmed") {
+        notify(p.phone, "Your ride has started", `The driver has started the journey ${ride.from} → ${ride.to}. You can now follow the live location.`, "/live-rides");
+      }
+    });
+
+    return res.json({ success: true, data: publicView(ride, hostPhone) });
+  } catch (err) {
+    console.error("liveRide begin error:", err.message);
+    return res.status(500).json({ success: false, message: "Could not start the journey." });
   }
 });
 
@@ -193,7 +321,12 @@ router.post("/:id/location", async (req, res) => {
     if (!samePhone(ride.hostPhone, phone)) {
       return res.status(403).json({ success: false, message: "Only the host can update the location." });
     }
-    if (ride.status !== "live") return res.status(400).json({ success: false, message: "This ride has ended." });
+    if (ride.status === "scheduled") {
+      return res.status(409).json({ success: false, code: "NOT_STARTED", message: "Start the journey before sharing location." });
+    }
+    if (ride.status !== "live" && ride.status !== "in_progress") {
+      return res.status(400).json({ success: false, message: "This ride has ended." });
+    }
     ride.currentLat = lat; ride.currentLon = lon; ride.lastLocationAt = new Date();
     await ride.save();
     return res.json({ success: true });
@@ -228,7 +361,11 @@ router.get("/", async (req, res) => {
   try {
     const member = await requireMember(req.query.phone, res);
     if (!member) return;
-    const rides = await LiveRide.find({ status: "live" }).sort({ startedAt: -1 }).limit(100);
+    // Opportunistically remind hosts whose scheduled start time has arrived.
+    await sweepDueScheduledLiveRides();
+    const rides = await LiveRide.find({ status: { $in: ["scheduled", "live", "in_progress"] } })
+      .sort({ status: 1, scheduledAt: 1, startedAt: -1 })
+      .limit(100);
     const viewer = normalizePhone(req.query.phone);
     return res.json({ success: true, data: rides.map((r) => publicView(r, viewer)) });
   } catch (err) {
@@ -256,7 +393,7 @@ router.post("/:id/join-order", async (req, res) => {
     const member = await requireMember(riderPhone, res);
     if (!member) return;
     const ride = await LiveRide.findById(req.params.id);
-    if (!ride || ride.status !== "live") return res.status(404).json({ success: false, message: "This live ride is no longer available." });
+    if (!ride || !["scheduled", "live", "in_progress"].includes(ride.status)) return res.status(404).json({ success: false, message: "This live ride is no longer available." });
     if (samePhone(ride.hostPhone, riderPhone) || (ride.hostId && member._id && String(ride.hostId) === String(member._id))) {
       return res.status(400).json({ success: false, message: "You are the host of this ride." });
     }
@@ -388,7 +525,7 @@ router.post("/:id/join-verify", async (req, res) => {
     const updated = await LiveRide.findOneAndUpdate(
       {
         _id: ride._id,
-        status: "live",
+        status: { $in: ["scheduled", "live", "in_progress"] },
         passengers: { $elemMatch: { phone: { $in: variants }, status: { $ne: "confirmed" } } },
         $expr: {
           $lt: [
@@ -436,8 +573,8 @@ router.post("/:id/stop", async (req, res) => {
     const ride = await LiveRide.findById(req.params.id);
     if (!ride) return res.status(404).json({ success: false, message: "Live ride not found." });
     if (!samePhone(ride.hostPhone, phone)) return res.status(403).json({ success: false, message: "Only the host can stop this ride." });
-    if (ride.status === "ended") return res.json({ success: true, data: publicView(ride, phone) });
-    ride.status = "ended"; ride.endedAt = new Date();
+    if (TERMINAL.includes(ride.status)) return res.json({ success: true, data: publicView(ride, phone) });
+    ride.status = "completed"; ride.endedAt = new Date();
     await ride.save();
 
     if (ride.rideId) {

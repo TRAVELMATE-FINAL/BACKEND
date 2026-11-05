@@ -41,6 +41,16 @@ const liveRideSchema = new mongoose.Schema(
     to: { type: String, required: true, trim: true },
     departureTime: { type: String, default: "", trim: true },
 
+    // Advance scheduling: a live ride can be posted hours before the journey.
+    // scheduledDate (YYYY-MM-DD) + departureTime (HH:MM) describe the planned
+    // start; scheduledAt is their combined Date for comparisons/notifications.
+    // A ride stays "scheduled" (NOT tracking) until the host manually begins it.
+    scheduledDate: { type: String, default: "", trim: true },
+    scheduledAt: { type: Date, default: null },
+    // Set once when we notify the host that their scheduled start time arrived
+    // (dedupes the reminder across polls). Null until notified.
+    journeyStartNotifiedAt: { type: Date, default: null },
+
     // Route geometry so live rides are findable in Find Ride (same shape as a
     // posted ride): origin/destination coordinates + ordered intermediate stops.
     fromLat: { type: Number, default: null },
@@ -60,7 +70,10 @@ const liveRideSchema = new mongoose.Schema(
     totalSeats: { type: Number, required: true, min: 1, max: 20 },
     farePerSeat: { type: Number, required: true, min: 0 },
 
-    status: { type: String, enum: ["live", "ended", "completed", "cancelled"], default: "live", index: true },
+    // scheduled  → posted in advance, NOT yet tracking (no location shared)
+    // live       → journey started by the host, GPS tracking is active
+    // completed/ended → journey finished (terminal); cancelled → called off
+    status: { type: String, enum: ["scheduled", "live", "in_progress", "ended", "completed", "cancelled"], default: "scheduled", index: true },
 
     // Latest GPS position pushed by the host device.
     currentLat: { type: Number, default: null },
@@ -69,7 +82,9 @@ const liveRideSchema = new mongoose.Schema(
     destLon: { type: Number, default: null },
     lastLocationAt: { type: Date, default: null },
 
-    startedAt: { type: Date, default: Date.now },
+    // Null until the host actually begins the journey (manual Start). A
+    // scheduled ride has no startedAt — tracking never runs before this is set.
+    startedAt: { type: Date, default: null },
     endedAt: { type: Date, default: null },
 
     passengers: { type: [passengerSchema], default: [] },
