@@ -32,6 +32,10 @@ const rideRequestSchema = new mongoose.Schema(
     droppingIndex:  { type: Number, default: null },
     seatsRequested: { type: Number, default: 1, min: 1 },
 
+    // Human-readable booking reference, generated when payment is verified and
+    // the booking is confirmed (e.g. "VGY-4F9K2A"). Shown to rider + driver.
+    bookingCode: { type: String, default: "" },
+
     // Lifecycle. PAY-FIRST flow:
     //   awaiting_payment → (rider pays) → pending → accepted / rejected / expired
     // "awaiting_payment" is an internal holding state that owns the Razorpay

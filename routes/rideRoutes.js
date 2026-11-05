@@ -969,7 +969,7 @@ router.get("/search", async (req, res) => {
     // ── Configurable nearby radius (km) ──────────────────────────────
     // Change NEARBY_RADIUS_KM in the backend env to widen/narrow how far
     // "nearby" reaches. Not hardcoded throughout — this single value drives it.
-    const RADIUS_KM = num(process.env.NEARBY_RADIUS_KM) || 15;
+    const RADIUS_KM = num(process.env.NEARBY_RADIUS_KM) || 25;
 
     const escapeRx = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -1797,9 +1797,9 @@ router.post("/requests/:reqId/request-pay-verify", async (req, res) => {
     }
     if (!(await requireVerifiedRider(req.body?.riderPhone, res))) return;
 
-    // Idempotent — already paid & sent.
-    if (reqDoc.paymentStatus === "paid" && reqDoc.status === "pending") {
-      return res.json({ success: true, alreadySent: true, data: reqDoc });
+    // Idempotent — already paid & confirmed (or legacy pending).
+    if (reqDoc.paymentStatus === "paid" && (reqDoc.status === "accepted" || reqDoc.status === "pending")) {
+      return res.json({ success: true, alreadySent: true, confirmed: reqDoc.status === "accepted", data: reqDoc });
     }
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ success: false, message: "Missing payment confirmation details" });
@@ -1852,23 +1852,45 @@ router.post("/requests/:reqId/request-pay-verify", async (req, res) => {
       return res.status(409).json({ success: false, refunded: true, message: "This ride just became full. Your payment has been refunded." });
     }
 
-    // Success → mark paid and SEND the request to the owner.
+    // Success → payment verified. The booking is CONFIRMED immediately — no
+    // driver approval/waiting step. Seats update automatically because the
+    // seat accounting counts "accepted" requests.
     reqDoc.paymentStatus = "paid";
     reqDoc.paymentId = razorpay_payment_id;
     reqDoc.amountPaid = reqDoc.amountDue;
     reqDoc.paidAt = new Date();
-    reqDoc.status = "pending"; // "Paid – Pending Ride Owner Response"
-    reqDoc.requestExpiresAt = new Date(Date.now() + REQUEST_TTL_MS);
+    reqDoc.status = "accepted"; // CONFIRMED on payment (instant booking)
+    reqDoc.requestExpiresAt = null; // no owner-response timer
+    if (!reqDoc.bookingCode) {
+      reqDoc.bookingCode =
+        "VGY-" + String(reqDoc._id).slice(-5).toUpperCase() +
+        Math.floor(10 + Math.random() * 89);
+    }
     await reqDoc.save();
 
-    // Notify owner: in-app + badge (Notification doc) + SMS.
-    notify(ride.userPhone, "New Ride Request",
-      `${reqDoc.riderName || "A rider"} has paid and requested to join your ride from ${ride.from} to ${ride.to}. Please Accept or Reject within 1 hour.`,
+    const seg = (reqDoc.boardingPoint && reqDoc.droppingPoint)
+      ? `${reqDoc.boardingPoint} → ${reqDoc.droppingPoint}`
+      : `${ride.from} → ${ride.to}`;
+
+    // Notify the DRIVER: a confirmed booking (no action required).
+    notify(ride.userPhone, "New Confirmed Booking",
+      `${reqDoc.riderName || "A passenger"} booked ${reqDoc.seatsRequested || 1} seat(s) on your ride (${seg}). Booking ${reqDoc.bookingCode}.`,
       "/requests");
     sendSms(ride.userPhone,
-      `Vooggly: New ride request from ${reqDoc.riderName || "a rider"} for ${ride.from} → ${ride.to}. Accept/Reject within 1 hour in the app.`);
+      `Vooggly: ${reqDoc.riderName || "A passenger"} confirmed a booking (${seg}, ${reqDoc.seatsRequested || 1} seat/s). Ref ${reqDoc.bookingCode}.`);
 
-    return res.json({ success: true, message: "Payment successful. Your request has been sent to the ride owner.", data: reqDoc });
+    // Notify the RIDER: booking confirmed, contact details now available.
+    notify(reqDoc.riderPhone, "Booking Confirmed",
+      `Your booking is confirmed (${seg}). Booking ${reqDoc.bookingCode}. You can now view the driver's contact and vehicle details.`,
+      "/requests?tab=sent");
+
+    return res.json({
+      success: true,
+      confirmed: true,
+      message: "Payment successful — your booking is confirmed.",
+      bookingCode: reqDoc.bookingCode,
+      data: reqDoc,
+    });
   } catch (err) {
     console.error("requestPayVerify error:", err);
     return res.status(500).json({ success: false, message: "Server error while confirming payment" });
@@ -1896,6 +1918,7 @@ router.get("/requests/incoming", async (req, res) => {
         _id: r._id, status: r.status, message: r.message,
         paymentStatus: r.paymentStatus || "none",
         amountPaid: r.amountPaid || 0,
+        bookingCode: r.bookingCode || "",
         // Where the rider boards / drops and how many seats they booked.
         boardingPoint: r.boardingPoint || (ride ? ride.from : ""),
         droppingPoint: r.droppingPoint || (ride ? ride.to : ""),
@@ -1958,6 +1981,7 @@ router.get("/requests/outgoing", async (req, res) => {
       }
       data.push({
         _id: r._id, status: r.status,
+        bookingCode: r.bookingCode || "",
         // Chosen boarding / dropping / seats for this booking.
         boardingPoint: r.boardingPoint || (ride ? ride.from : ""),
         droppingPoint: r.droppingPoint || (ride ? ride.to : ""),
