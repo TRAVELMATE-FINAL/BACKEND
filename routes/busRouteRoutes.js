@@ -5,6 +5,7 @@
 const express = require("express");
 const router = express.Router();
 const BusRoute = require("../models/BusRoute");
+const { isChennaiRoute } = require("../utils/chennai");
 
 const normKey = (s) => String(s || "").toUpperCase().replace(/[\s-]+/g, "");
 
@@ -16,7 +17,9 @@ router.get("/:number", async (req, res) => {
       return res.status(400).json({ success: false, message: "Please enter a bus number." });
     }
     const route = await BusRoute.findOne({ searchKey: key, active: true }).lean();
-    if (!route) {
+    // Chennai-only: only surface routes entirely within Chennai (guards any
+    // legacy non-Chennai rows so the public site shows Chennai routes only).
+    if (!route || !isChennaiRoute(route)) {
       return res.status(404).json({
         success: false,
         code: "NOT_FOUND",
@@ -37,10 +40,12 @@ router.get("/", async (req, res) => {
     const q = normKey(req.query.q);
     if (!q || q.length < 1) return res.json({ success: true, data: [] });
     const rows = await BusRoute.find({ searchKey: { $regex: "^" + q }, active: true })
-      .select("busNumber from to operator")
-      .limit(8)
+      .select("busNumber from to operator stops")
+      .limit(16)
       .lean();
-    return res.json({ success: true, data: rows });
+    // Chennai-only suggestions.
+    const filtered = rows.filter((r) => isChennaiRoute(r)).slice(0, 8);
+    return res.json({ success: true, data: filtered });
   } catch (err) {
     return res.json({ success: true, data: [] });
   }
