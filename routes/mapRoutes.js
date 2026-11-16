@@ -75,7 +75,7 @@ async function googleSearch(q) {
           "X-Goog-Api-Key": GOOGLE_KEY,
           "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location",
         },
-        timeout: 8000,
+        timeout: 6000,
       }
     );
     const places = (r.data && r.data.places) || [];
@@ -107,9 +107,11 @@ async function googleSearch(q) {
 async function photonSearch(q) {
   try {
     const r = await axios.get("https://photon.komoot.io/api/", {
-      params: { q, limit: 10, lang: "en", lat: 22.0, lon: 79.0 }, // bias toward India
+      // Bias toward Tamil Nadu / South India so interior villages, localities and
+      // streets rank well (Photon is strong at type-ahead for small places).
+      params: { q, limit: 12, lang: "en", lat: 11.0, lon: 78.7 },
       headers: { "User-Agent": UA },
-      timeout: 8000,
+      timeout: 6000,
     });
     const feats = (r.data && r.data.features) || [];
     return feats
@@ -142,9 +144,11 @@ async function photonSearch(q) {
 async function nominatimSearch(q) {
   try {
     const r = await axios.get("https://nominatim.openstreetmap.org/search", {
-      params: { q, format: "json", limit: 8, countrycodes: "in", addressdetails: 1, "accept-language": "en", dedupe: 1 },
+      // countrycodes=in keeps it in India; addressdetails lets us label villages,
+      // hamlets, suburbs and streets correctly (not just districts/cities).
+      params: { q, format: "json", limit: 10, countrycodes: "in", addressdetails: 1, "accept-language": "en", dedupe: 1 },
       headers: { "User-Agent": UA, "Accept-Language": "en" },
-      timeout: 8000,
+      timeout: 6000,
     });
     const rows = Array.isArray(r.data) ? r.data : [];
     return rows.map((hit) => {
@@ -162,17 +166,38 @@ async function nominatimSearch(q) {
 }
 
 router.get("/autocomplete", async (req, res) => {
+  const started = Date.now();
   try {
     const q = (req.query.q || "").trim();
     if (!q) return res.json({ results: [] });
 
-    // Google (best, typo-tolerant) when a server key is configured, else the
-    // free geocoders. Each returns [] on failure so we always fall through.
-    let results = await googleSearch(q);
-    if (!results.length) results = await photonSearch(q);
-    if (!results.length) results = await nominatimSearch(q);
+    // Run Google (best, typo-tolerant — needs a server key) AND Photon (free,
+    // excellent for interior villages / localities / streets) in PARALLEL so a
+    // slow or failing Google key never blocks results. Prefer Google when it
+    // returns; otherwise Photon; otherwise Nominatim. Each resolves to [] on
+    // failure, so interior searches always get an answer (or a clean empty).
+    const [g, p] = await Promise.all([
+      googleSearch(q).catch(() => []),
+      photonSearch(q).catch(() => []),
+    ]);
 
-    return res.json({ results: results.slice(0, 8) });
+    let results = [];
+    let provider = "none";
+    if (g.length) { results = g; provider = "google"; }
+    else if (p.length) { results = p; provider = "photon"; }
+    else {
+      results = await nominatimSearch(q).catch(() => []);
+      provider = results.length ? "nominatim" : "none";
+    }
+
+    const ms = Date.now() - started;
+    console.log(`autocomplete q="${q}" -> ${provider} (${results.length}) ${ms}ms`);
+
+    const payload = { results: results.slice(0, 8) };
+    // ?debug=1 → see which provider served + whether the server Google key is
+    // present, so key/restriction problems are diagnosable without code changes.
+    if (req.query.debug) payload.debug = { provider, ms, hasGoogleKey: !!GOOGLE_KEY, counts: { google: g.length, photon: p.length } };
+    return res.json(payload);
   } catch (err) {
     console.error("autocomplete error:", err.message);
     return res.json({ results: [] }); // never break the UI — just no suggestions
