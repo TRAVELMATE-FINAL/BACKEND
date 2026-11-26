@@ -317,55 +317,80 @@ router.post("/bus-nearby", async (req, res) => {
 
 // ============================================================
 // GET /api/route?fromLat=..&fromLng=..&toLat=..&toLng=..
-// → { distance: "460 km", duration: "7 hr 30 min", geometry: [[lon,lat], ...] }
+// → { distance, duration, geometry:[[lon,lat],...], alternatives:[ {distance,
+//     duration, geometry, summary}, ... ] }
+// Returns the ACTUAL road route (and up to 2 alternative road routes). Uses the
+// reliable FOSSGIS OSRM instance first, then the OSRM demo server as a fallback,
+// so the frontend gets real road geometry instead of falling back to a straight
+// line. Back-compatible: the primary route's fields stay at the top level.
 // ============================================================
+const OSRM_HOSTS = [
+  "https://routing.openstreetmap.de/routed-car",
+  "https://router.project-osrm.org",
+];
+
+function fmtKm(m) {
+  const km = m / 1000;
+  return km >= 100 ? `${Math.round(km)} km` : `${km.toFixed(1)} km`;
+}
+function fmtDur(s) {
+  const t = Math.round(s / 60);
+  const h = Math.floor(t / 60), m = t % 60;
+  return h > 0 ? `${h} hr ${m} min` : `${m} min`;
+}
+function routeSummary(rt) {
+  // A short "via …" label from the longest named leg/step if available.
+  try {
+    const legs = rt.legs || [];
+    const names = [];
+    legs.forEach((lg) => (lg.steps || []).forEach((st) => { if (st.name) names.push(st.name); }));
+    const uniq = [...new Set(names.filter(Boolean))];
+    return uniq.length ? uniq.sort((a, b) => b.length - a.length)[0] : "";
+  } catch { return ""; }
+}
+
+// Try each OSRM host until one answers with routes.
+async function osrmRoutes(coords) {
+  const path = `/route/v1/driving/${coords}?overview=full&geometries=geojson&alternatives=3&steps=true`;
+  for (const host of OSRM_HOSTS) {
+    try {
+      const r = await axios.get(host + path, { headers: { "User-Agent": UA }, timeout: 12000 });
+      if (r.data && r.data.code === "Ok" && Array.isArray(r.data.routes) && r.data.routes.length) {
+        return r.data.routes;
+      }
+    } catch (e) {
+      console.warn("osrm host failed:", host, e.response && e.response.status, e.message);
+    }
+  }
+  return null;
+}
+
 router.get("/route", async (req, res) => {
   try {
     const { fromLat, fromLng, toLat, toLng } = req.query;
-
     if (!fromLat || !fromLng || !toLat || !toLng) {
-      return res
-        .status(400)
-        .json({ error: "fromLat, fromLng, toLat, toLng are required" });
+      return res.status(400).json({ error: "fromLat, fromLng, toLat, toLng are required" });
     }
 
-    const url =
-      `https://router.project-osrm.org/route/v1/driving/` +
-      `${fromLng},${fromLat};${toLng},${toLat}` +
-      `?overview=full&geometries=geojson`;
+    const coords = `${fromLng},${fromLat};${toLng},${toLat}`;
+    const routes = await osrmRoutes(coords);
+    if (!routes) return res.status(502).json({ error: "Routing service unavailable" });
 
-    const r = await axios.get(url, {
-      headers: { "User-Agent": UA },
-      timeout: 12000,
+    const mapRoute = (rt) => ({
+      distance: fmtKm(rt.distance),
+      duration: fmtDur(rt.duration),
+      distanceKm: Number((rt.distance / 1000).toFixed(2)),
+      durationMin: Math.round(rt.duration / 60),
+      geometry: rt.geometry.coordinates, // [[lon, lat], ...]
+      summary: routeSummary(rt),
     });
 
-    if (r.data.code !== "Ok" || !r.data.routes?.length) {
-      return res.status(404).json({ error: "No route found" });
-    }
-
-    const route = r.data.routes[0];
-
-    // distance: meters → "X km"   (one decimal under 100 km)
-    const km = route.distance / 1000;
-    const distance = km >= 100 ? `${Math.round(km)} km` : `${km.toFixed(1)} km`;
-
-    // duration: seconds → "X hr Y min"  or  "Y min"
-    const totalMin = Math.round(route.duration / 60);
-    const hr = Math.floor(totalMin / 60);
-    const min = totalMin % 60;
-    const duration = hr > 0 ? `${hr} hr ${min} min` : `${min} min`;
-
-    return res.json({
-      distance,
-      duration,
-      geometry: route.geometry.coordinates, // [[lon, lat], ...]
-    });
+    const primary = mapRoute(routes[0]);
+    const alternatives = routes.slice(1, 3).map(mapRoute);
+    return res.json({ ...primary, alternatives });
   } catch (err) {
     console.error("route error:", err.message);
-    const status = err.response?.status || 500;
-    return res
-      .status(status)
-      .json({ error: err.response?.data?.error || "Route lookup failed" });
+    return res.status(500).json({ error: "Route lookup failed" });
   }
 });
 
