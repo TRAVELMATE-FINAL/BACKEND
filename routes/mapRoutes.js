@@ -205,6 +205,117 @@ router.get("/autocomplete", async (req, res) => {
 });
 
 // ============================================================
+// POST /api/bus-nearby   { points: [{ lat, lon, name }] }
+// → { nearby: [{ point, name, landmarks: [{ name, category, dist }] }] }
+//
+// Returns REAL nearby places (hospitals, colleges, railway/metro/bus stations,
+// malls, attractions, temples) around each bus stop, straight from
+// OpenStreetMap via the Overpass API. No invented/assumed data — only what OSM
+// actually has. One batched Overpass query covers the whole route (all stops),
+// and results are cached, so a route lookup makes at most one upstream call.
+// ============================================================
+const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+const nearbyCache = new Map(); // key -> { t, data }
+const NEARBY_TTL = 24 * 60 * 60 * 1000; // 24h
+
+function metersBetween(aLat, aLon, bLat, bLon) {
+  const R = 6371000;
+  const toRad = (x) => (x * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat), dLon = toRad(bLon - aLon);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
+
+// Friendly category label from OSM tags.
+function osmCategory(t) {
+  if (!t) return "Landmark";
+  if (t.railway === "station" || t.railway === "halt" || t.railway === "subway_entrance" || t.station === "subway") return "Railway / Metro";
+  if (t.public_transport === "station") return "Station";
+  if (t.amenity === "bus_station") return "Bus stand";
+  if (t.amenity === "hospital" || t.amenity === "clinic") return "Hospital";
+  if (t.amenity === "college" || t.amenity === "university") return "College";
+  if (t.amenity === "school") return "School";
+  if (t.amenity === "place_of_worship") return "Temple / Church / Mosque";
+  if (t.amenity === "marketplace") return "Market";
+  if (t.shop === "mall") return "Mall";
+  if (t.tourism === "attraction" || t.tourism === "museum") return "Landmark";
+  return "Landmark";
+}
+
+router.post("/bus-nearby", async (req, res) => {
+  try {
+    const raw = Array.isArray(req.body && req.body.points) ? req.body.points.slice(0, 30) : [];
+    const pts = raw
+      .map((p) => ({ lat: Number(p.lat), lon: Number(p.lon), name: String(p.name || "") }))
+      .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+    if (!pts.length) return res.json({ nearby: [] });
+
+    // Cache key = rounded coords of all points (a given route is stable).
+    const key = pts.map((p) => p.lat.toFixed(3) + "," + p.lon.toFixed(3)).join("|");
+    const hit = nearbyCache.get(key);
+    if (hit && Date.now() - hit.t < NEARBY_TTL) return res.json({ nearby: hit.data });
+
+    const R = 500; // metres around each stop
+    const clauses = pts.map((p) => `
+      nwr(around:${R},${p.lat},${p.lon})[amenity~"^(hospital|clinic|college|university|bus_station|marketplace|place_of_worship)$"][name];
+      nwr(around:${R},${p.lat},${p.lon})[railway~"^(station|halt|subway_entrance)$"][name];
+      nwr(around:${R},${p.lat},${p.lon})[public_transport=station][name];
+      nwr(around:${R},${p.lat},${p.lon})[shop=mall][name];
+      nwr(around:${R},${p.lat},${p.lon})[tourism~"^(attraction|museum)$"][name];
+    `).join("\n");
+    const query = `[out:json][timeout:25];(${clauses});out center 250;`;
+
+    let elements = [];
+    try {
+      const r = await axios.post(OVERPASS_URL, "data=" + encodeURIComponent(query), {
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA },
+        timeout: 20000,
+      });
+      elements = (r.data && r.data.elements) || [];
+    } catch (e) {
+      console.warn("overpass error:", e.response && e.response.status, e.message);
+      return res.json({ nearby: pts.map((p, i) => ({ point: i, name: p.name, landmarks: [] })) });
+    }
+
+    const buckets = pts.map(() => []);
+    const seen = pts.map(() => new Set());
+    for (const el of elements) {
+      const t = el.tags || {};
+      const name = t.name;
+      if (!name) continue;
+      const elat = el.lat != null ? el.lat : (el.center && el.center.lat);
+      const elon = el.lon != null ? el.lon : (el.center && el.center.lon);
+      if (elat == null || elon == null) continue;
+      // Assign the place to the nearest stop.
+      let best = -1, bestD = Infinity;
+      for (let i = 0; i < pts.length; i++) {
+        const d = metersBetween(pts[i].lat, pts[i].lon, elat, elon);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      if (best < 0 || bestD > R + 60) continue;
+      const lc = name.trim().toLowerCase();
+      if (seen[best].has(lc)) continue;
+      seen[best].add(lc);
+      buckets[best].push({ name: name.trim(), category: osmCategory(t), dist: Math.round(bestD) });
+    }
+
+    const nearby = buckets.map((arr, i) => ({
+      point: i,
+      name: pts[i].name,
+      landmarks: arr.sort((a, b) => a.dist - b.dist).slice(0, 6),
+    }));
+
+    nearbyCache.set(key, { t: Date.now(), data: nearby });
+    return res.json({ nearby });
+  } catch (err) {
+    console.error("bus-nearby error:", err.message);
+    return res.json({ nearby: [] });
+  }
+});
+
+// ============================================================
 // GET /api/route?fromLat=..&fromLng=..&toLat=..&toLng=..
 // → { distance: "460 km", duration: "7 hr 30 min", geometry: [[lon,lat], ...] }
 // ============================================================
